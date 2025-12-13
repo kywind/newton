@@ -219,10 +219,14 @@ def eval_particle_body_contact(
         return
 
     # take average material properties of shape and particle parameters
-    ke = 0.5 * (particle_ke + shape_material_ke[shape_index])
-    kd = 0.5 * (particle_kd + shape_material_kd[shape_index])
-    kf = 0.5 * (particle_kf + shape_material_kf[shape_index])
-    mu = 0.5 * (particle_mu + shape_material_mu[shape_index])
+    # ke = 0.5 * (particle_ke + shape_material_ke[shape_index])
+    # kd = 0.5 * (particle_kd + shape_material_kd[shape_index])
+    # kf = 0.5 * (particle_kf + shape_material_kf[shape_index])
+    # mu = 0.5 * (particle_mu + shape_material_mu[shape_index])
+    ke = particle_ke
+    kd = particle_kd
+    kf = particle_kf
+    mu = particle_mu
 
     body_w = wp.spatial_bottom(body_v_s)
     body_v = wp.spatial_top(body_v_s)

@@ -323,27 +323,27 @@ class SolverFeatherstone(SolverBase):
                     device=model.device,
                 )
 
-            # damped springs
-            eval_spring_forces(model, state_in, particle_f)
+            # # damped springs
+            # eval_spring_forces(model, state_in, particle_f)
 
-            # triangle elastic and lift/drag forces
-            eval_triangle_forces(model, state_in, control, particle_f)
+            # # triangle elastic and lift/drag forces
+            # eval_triangle_forces(model, state_in, control, particle_f)
 
-            # triangle bending
-            eval_bending_forces(model, state_in, particle_f)
+            # # triangle bending
+            # eval_bending_forces(model, state_in, particle_f)
 
-            # tetrahedral FEM
-            eval_tetrahedra_forces(model, state_in, control, particle_f)
+            # # tetrahedral FEM
+            # eval_tetrahedra_forces(model, state_in, control, particle_f)
 
-            # particle-particle interactions
-            eval_particle_contact_forces(model, state_in, particle_f)
+            # # particle-particle interactions
+            # eval_particle_contact_forces(model, state_in, particle_f)
 
             # particle shape contact
             eval_particle_body_contact_forces(model, state_in, contacts, particle_f, body_f, body_f_in_world_frame=True)
 
             # muscles
-            if False:
-                eval_muscle_forces(model, state_in, control, body_f)
+            # if False:
+            #     eval_muscle_forces(model, state_in, control, body_f)
 
             # ----------------------------
             # articulations
