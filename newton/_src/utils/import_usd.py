@@ -263,7 +263,8 @@ def parse_usd(
         ):
             return
         path_name = str(prim.GetPath())
-        if any(re.match(path, path_name) for path in ignore_paths):
+        # if any(re.match(path, path_name) for path in ignore_paths):
+        if any(path == path_name for path in ignore_paths):  # exact match only
             return
 
         incoming_xform_mat = wp.transform_compose(incoming_xform.p, incoming_xform.q, incoming_scale)
@@ -1022,7 +1023,8 @@ def parse_usd(
             if warn_invalid_desc(prim_path, rigid_body_desc):
                 continue
             body_path = str(prim_path)
-            if any(re.match(p, body_path) for p in ignore_paths):
+            # if any(re.match(p, body_path) for p in ignore_paths):
+            if any(p == body_path for p in ignore_paths):  # exact match only
                 ignored_body_paths.add(body_path)
                 continue
             body_specs[body_path] = rigid_body_desc
@@ -1069,7 +1071,8 @@ def parse_usd(
             if warn_invalid_desc(path, desc):
                 continue
             articulation_path = str(path)
-            if any(re.match(p, articulation_path) for p in ignore_paths):
+            # if any(re.match(p, articulation_path) for p in ignore_paths):
+            if any(p == articulation_path for p in ignore_paths):  # exact match only
                 continue
             articulation_prim = stage.GetPrimAtPath(path)
             # Collect engine-specific attributes for the articulation root on first encounter
@@ -1167,7 +1170,8 @@ def parse_usd(
                 #! it may be possible that a joint is filtered out in the middle of
                 #! a chain of joints, which results in a disconnected graph
                 #! we should raise an error in this case
-                if any(re.match(p, joint_key) for p in ignore_paths):
+                # if any(re.match(p, joint_key) for p in ignore_paths):
+                if any(p == joint_key for p in ignore_paths):  # exact match only
                     continue
                 if str(joint_desc.body0) in ignored_body_paths:
                     continue
@@ -1314,7 +1318,8 @@ def parse_usd(
                 if warn_invalid_desc(xpath, shape_spec):
                     continue
                 path = str(xpath)
-                if any(re.match(p, path) for p in ignore_paths):
+                # if any(re.match(p, path) for p in ignore_paths):
+                if any(p == path for p in ignore_paths):  # exact match only
                     continue
                 prim = stage.GetPrimAtPath(xpath)
                 # print(prim)

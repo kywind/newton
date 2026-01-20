@@ -640,6 +640,7 @@ def get_mesh(
     load_normals: bool = False,
     load_uvs: bool = False,
     maxhullvert: int = MESH_MAXHULLVERT,
+    time: Usd.TimeCode | None = None,
     face_varying_normal_conversion: Literal[
         "vertex_averaging", "angle_weighted", "vertex_splitting"
     ] = "vertex_splitting",
@@ -672,6 +673,7 @@ def get_mesh(
         load_normals (bool): Whether to load the normals.
         load_uvs (bool): Whether to load the UVs.
         maxhullvert (int): The maximum number of vertices for the convex hull approximation.
+        time (Usd.TimeCode | None): USD time code to sample; defaults to ``Usd.TimeCode.Default()``.
         face_varying_normal_conversion (Literal["vertex_averaging", "angle_weighted", "vertex_splitting"]):
             This argument specifies how to convert "faceVarying" normals
             (normals defined per-corner rather than per-vertex) into per-vertex normals for the mesh.
@@ -700,21 +702,24 @@ def get_mesh(
 
     mesh = UsdGeom.Mesh(prim)
 
-    points = np.array(mesh.GetPointsAttr().Get(), dtype=np.float64)
-    indices = np.array(mesh.GetFaceVertexIndicesAttr().Get(), dtype=np.int32)
-    counts = mesh.GetFaceVertexCountsAttr().Get()
+    if time is None:
+        time = Usd.TimeCode.Default()
+
+    points = np.array(mesh.GetPointsAttr().Get(time), dtype=np.float64)
+    indices = np.array(mesh.GetFaceVertexIndicesAttr().Get(time), dtype=np.int32)
+    counts = mesh.GetFaceVertexCountsAttr().Get(time)
 
     uvs = None
     if load_uvs:
         uv_primvar = UsdGeom.PrimvarsAPI(prim).GetPrimvar("st")
         if uv_primvar:
-            uvs = uv_primvar.Get()
+            uvs = uv_primvar.Get(time)
 
     normals = None
     if load_normals:
         normals_attr = mesh.GetNormalsAttr()
         if normals_attr:
-            normals = normals_attr.Get()
+            normals = normals_attr.Get(time)
 
     if normals is not None:
         normals = np.array(normals, dtype=np.float64)

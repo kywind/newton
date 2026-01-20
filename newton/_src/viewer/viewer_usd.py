@@ -23,9 +23,9 @@ import warp as wp
 from ..core.types import override
 
 try:
-    from pxr import Gf, Sdf, Usd, UsdGeom, Vt
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, Vt
 except ImportError:
-    Gf = Sdf = Usd = UsdGeom = Vt = None
+    Gf = Sdf = Usd = UsdGeom = UsdPhysics = Vt = None
 
 from .viewer import ViewerBase
 
@@ -303,6 +303,14 @@ class ViewerUSD(ViewerBase):
 
                 UsdGeom.Imageable(instance).GetVisibilityAttr().Set("inherited" if not hidden else "invisible")
                 _usd_add_xform(instance)
+
+                # apply physics APIs if available (cannot be used in import_usd.py yet)
+                # if UsdPhysics is not None:
+                #     rigid_api = UsdPhysics.RigidBodyAPI.Apply(instance)
+                #     rigid_api.GetRigidBodyEnabledAttr().Set(True)
+                #     rigid_api.GetKinematicEnabledAttr().Set(True)
+                #     collision_api = UsdPhysics.CollisionAPI.Apply(instance)
+                #     collision_api.GetCollisionEnabledAttr().Set(True)
 
             # update transform
             if xforms is not None:
