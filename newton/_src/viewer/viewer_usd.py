@@ -20,12 +20,17 @@ import os
 import numpy as np
 import warp as wp
 
+try:
+    import omni
+except:
+    print("Warning: Isaac Sim imports failed. ViewerUSD will not support use_omni_usd mode.")
+
 from ..core.types import override
 
 try:
-    from pxr import Gf, Sdf, Usd, UsdGeom, Vt
+    from pxr import Gf, Sdf, Usd, UsdGeom, UsdPhysics, Vt
 except ImportError:
-    Gf = Sdf = Usd = UsdGeom = Vt = None
+    Gf = Sdf = Usd = UsdGeom = UsdPhysics = Vt = None
 
 from .viewer import ViewerBase
 
@@ -82,7 +87,7 @@ class ViewerUSD(ViewerBase):
     and visualization of simulation data.
     """
 
-    def __init__(self, output_path, fps=60, up_axis="Z", num_frames=100, scaling=1.0):
+    def __init__(self, output_path, fps=60, up_axis="Z", num_frames=100, scaling=1.0, use_omni_usd=False):
         """
         Initialize the USD viewer backend for Newton physics simulations.
 
@@ -109,12 +114,16 @@ class ViewerUSD(ViewerBase):
         # Create USD stage. If this output path is already registered in the
         # current process, reuse and clear the existing layer instead of
         # calling CreateNew() again (which raises for duplicate identifiers).
-        existing_layer = Sdf.Layer.Find(self.output_path)
-        if existing_layer is not None:
-            existing_layer.Clear()
-            self.stage = Usd.Stage.Open(existing_layer)
+        if use_omni_usd:
+            success = omni.usd.get_context().new_stage()
+            self.stage = omni.usd.get_context().get_stage()
         else:
-            self.stage = Usd.Stage.CreateNew(self.output_path)
+            existing_layer = Sdf.Layer.Find(self.output_path)
+            if existing_layer is not None:
+                existing_layer.Clear()
+                self.stage = Usd.Stage.Open(existing_layer)
+            else:
+                self.stage = Usd.Stage.CreateNew(self.output_path)
         self.stage.SetTimeCodesPerSecond(fps)  # number of timeCodes per second for data storage
         self.stage.SetFramesPerSecond(fps)  # display frame rate (timeline FPS in DCC tools)
         self.stage.SetStartTimeCode(0)
@@ -311,6 +320,14 @@ class ViewerUSD(ViewerBase):
 
                 UsdGeom.Imageable(instance).GetVisibilityAttr().Set("inherited" if not hidden else "invisible")
                 _usd_add_xform(instance)
+
+                # apply physics APIs if available (cannot be used in import_usd.py yet)
+                # if UsdPhysics is not None:
+                #     rigid_api = UsdPhysics.RigidBodyAPI.Apply(instance)
+                #     rigid_api.GetRigidBodyEnabledAttr().Set(True)
+                #     rigid_api.GetKinematicEnabledAttr().Set(True)
+                #     collision_api = UsdPhysics.CollisionAPI.Apply(instance)
+                #     collision_api.GetCollisionEnabledAttr().Set(True)
 
             # update transform
             if xforms is not None:
