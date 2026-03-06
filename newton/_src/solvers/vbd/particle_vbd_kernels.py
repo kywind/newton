@@ -2939,6 +2939,8 @@ def accumulate_particle_body_contact_force_and_hessian(
     # outputs: particle force and hessian
     particle_forces: wp.array(dtype=wp.vec3),
     particle_hessians: wp.array(dtype=wp.mat33),
+    # output: body reaction force (Newton's 3rd law, for external rigid solver coupling)
+    body_f: wp.array(dtype=wp.spatial_vector),
 ):
     t_id = wp.tid()
 
@@ -2977,6 +2979,16 @@ def accumulate_particle_body_contact_force_and_hessian(
             )
             wp.atomic_add(particle_forces, particle_idx, body_contact_force)
             wp.atomic_add(particle_hessians, particle_idx, body_contact_hessian)
+
+            # Accumulate reaction force on body (Newton's 3rd law)
+            shape_idx = contact_shape[t_id]
+            body_idx = shape_body[shape_idx]
+            if body_idx >= 0:
+                X_wb = body_q[body_idx]
+                contact_world = wp.transform_point(X_wb, contact_body_pos[t_id])
+                r = contact_world - wp.transform_get_translation(X_wb)
+                reaction = -body_contact_force
+                wp.atomic_add(body_f, body_idx, wp.spatial_vector(reaction, wp.cross(r, reaction)))
 
 
 @wp.kernel

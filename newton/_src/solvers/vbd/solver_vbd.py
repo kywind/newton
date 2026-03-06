@@ -149,6 +149,7 @@ class SolverVBD(SolverBase):
         iterations: int = 10,
         friction_epsilon: float = 1e-2,
         integrate_with_external_rigid_solver: bool = False,
+        two_way_coupling: bool = False,
         # Particle parameters
         particle_enable_self_contact: bool = False,
         particle_self_contact_radius: float = 0.2,
@@ -198,6 +199,10 @@ class SolverVBD(SolverBase):
                 `particle_self_contact_radius` to avoid missing contacts.
             integrate_with_external_rigid_solver: Indicator for coupled rigid body-cloth simulation. When set to `True`,
                 the solver assumes rigid bodies are integrated by an external solver (one-way coupling).
+            two_way_coupling: If True and ``integrate_with_external_rigid_solver`` is also True, cloth contact
+                reaction forces are written to ``state_out.body_f`` each step so that an external rigid solver
+                (e.g. SolverMuJoCo) can apply them as ``xfrc_applied`` on the next step (staggered one-step-lag
+                coupling).
             particle_conservative_bound_relaxation: Relaxation factor for conservative penetration-free projection.
             particle_vertex_contact_buffer_size: Preallocation size for each vertex's vertex-triangle collision buffer.
             particle_edge_contact_buffer_size: Preallocation size for edge's edge-edge collision buffer.
@@ -269,6 +274,7 @@ class SolverVBD(SolverBase):
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
         # participate in particle-rigid interaction on the particle side.
         self.integrate_with_external_rigid_solver = integrate_with_external_rigid_solver
+        self.two_way_coupling = two_way_coupling
 
         # Initialize particle system
         self._init_particle_system(
@@ -559,6 +565,10 @@ class SolverVBD(SolverBase):
         self.body_particle_contact_material_ke = wp.zeros(max_soft_contacts, dtype=float, device=self.device)
         self.body_particle_contact_material_kd = wp.zeros(max_soft_contacts, dtype=float, device=self.device)
         self.body_particle_contact_material_mu = wp.zeros(max_soft_contacts, dtype=float, device=self.device)
+
+        # Buffer for cloth-on-body reaction forces (written by particle solve, read by external rigid solver)
+        # Allocated with max(1, body_count) to always provide a valid array for kernel launches.
+        self.cloth_body_f = wp.zeros(max(1, model.body_count), dtype=wp.spatial_vector, device=self.device)
 
         # Validation
         has_bodies = self.model.body_count > 0
@@ -1187,6 +1197,11 @@ class SolverVBD(SolverBase):
         self.finalize_rigid_bodies(state_out, dt)
         self.finalize_particles(state_out, dt)
 
+        # Staggered two-way coupling: write cloth contact forces to state_out.body_f so the
+        # external rigid solver (e.g. SolverMuJoCo) can apply them as xfrc_applied next step.
+        if self.two_way_coupling and self.integrate_with_external_rigid_solver and self.model.body_count > 0 and state_out.body_f is not None:
+            wp.copy(state_out.body_f, self.cloth_body_f, count=self.model.body_count)
+
     def penetration_free_truncation(self, particle_q_out=None):
         """
         Modify displacements_in in-place, also modify particle_q if its not None
@@ -1509,6 +1524,7 @@ class SolverVBD(SolverBase):
         # Zero out forces and hessians
         self.particle_forces.zero_()
         self.particle_hessians.zero_()
+        self.cloth_body_f.zero_()
 
         # Iterate over color groups
         for color in range(len(self.model.particle_color_groups)):
@@ -1545,6 +1561,7 @@ class SolverVBD(SolverBase):
                     outputs=[
                         self.particle_forces,
                         self.particle_hessians,
+                        self.cloth_body_f,
                     ],
                     device=self.device,
                 )

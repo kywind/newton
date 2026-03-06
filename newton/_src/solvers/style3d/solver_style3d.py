@@ -118,6 +118,7 @@ class SolverStyle3D(SolverBase):
         linear_iterations: int = 10,
         drag_spring_stiff: float = 1e2,
         enable_mouse_dragging: bool = False,
+        two_way_coupling: bool = False,
     ):
         """
         Args:
@@ -126,6 +127,9 @@ class SolverStyle3D(SolverBase):
             linear_iterations: Number of linear iterations (currently PCG iter) per non-linear iteration.
             drag_spring_stiff: The stiffness of spring connecting barycentric-weighted drag-point and target-point.
             enable_mouse_dragging: Enable/disable dragging kernel.
+            two_way_coupling: If True, cloth contact reaction forces are written to ``state_out.body_f``
+                each step so that an external rigid solver (e.g. SolverMuJoCo) can apply them as
+                ``xfrc_applied`` on the next step (staggered one-step-lag coupling).
         """
 
         super().__init__(model)
@@ -140,6 +144,7 @@ class SolverStyle3D(SolverBase):
         self.nonlinear_iterations = iterations
         self.drag_spring_stiff = drag_spring_stiff
         self.enable_mouse_dragging = enable_mouse_dragging
+        self.two_way_coupling = two_way_coupling
         self.pd_matrix_builder = PDMatrixBuilder(model.particle_count)
         self.linear_solver = PcgSolver(model.particle_count, self.device)
 
@@ -343,6 +348,10 @@ class SolverStyle3D(SolverBase):
 
         if self.collision is not None:
             self.collision.frame_end(state_out.particle_q, state_out.particle_qd, dt)
+            # Staggered two-way coupling: write cloth contact forces to state_out.body_f so the
+            # external rigid solver (e.g. SolverMuJoCo) can apply them as xfrc_applied next step.
+            if self.two_way_coupling and self.model.body_count > 0 and state_out.body_f is not None:
+                wp.copy(state_out.body_f, self.collision.cloth_body_f, count=self.model.body_count)
 
     def rebuild_bvh(self, state: State):
         if self.collision is not None:

@@ -51,6 +51,8 @@ class Collision:
         self.tri_bvh = BvhTri(model.tri_count, self.model.device)
         self.edge_bvh = BvhEdge(model.edge_count, self.model.device)
         self.body_contact_max = model.shape_count * model.particle_count
+        # Buffer for cloth-on-body reaction forces (written by contact kernel, read by external rigid solver)
+        self.cloth_body_f = wp.zeros(max(1, model.body_count), dtype=wp.spatial_vector, device=self.model.device)
         self.broad_phase_ee = wp.array(shape=(32, model.edge_count), dtype=int, device=self.model.device)
         self.broad_phase_ef = wp.array(shape=(32, model.edge_count), dtype=int, device=self.model.device)
         self.broad_phase_vf = wp.array(shape=(32, model.particle_count), dtype=int, device=self.model.device)
@@ -158,6 +160,7 @@ class Collision:
         """
         thickness = 2.0 * self.radius
         self.contact_hessian_diags.zero_()
+        self.cloth_body_f.zero_()
 
         if self.stiff_vf > 0:
             wp.launch(
@@ -235,7 +238,7 @@ class Collision:
                 contacts.soft_contact_body_vel,
                 contacts.soft_contact_normal,
             ],
-            outputs=[particle_forces, self.contact_hessian_diags],
+            outputs=[particle_forces, self.contact_hessian_diags, self.cloth_body_f],
             device=self.model.device,
         )
 
