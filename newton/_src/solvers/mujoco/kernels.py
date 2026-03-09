@@ -484,6 +484,8 @@ def convert_mj_coords_to_warp_kernel(
         for i in range(3):
             # convert velocity components
             joint_qd[wqd_i + i] = qvel[worldid, qd_i + i]
+    elif type == JointType.CABLE:
+        pass
     else:
         axis_count = joint_dof_dim[jntid, 0] + joint_dof_dim[jntid, 1]
         for i in range(axis_count):
@@ -578,6 +580,8 @@ def convert_warp_coords_to_mj_kernel(
         for i in range(3):
             # convert velocity components
             qvel[worldid, qd_i + i] = joint_qd[wqd_i + i]
+    elif type == JointType.CABLE:
+        pass
     else:
         axis_count = joint_dof_dim[jntid, 0] + joint_dof_dim[jntid, 1]
         for i in range(axis_count):
@@ -645,6 +649,8 @@ def sync_qpos0_kernel(
         qpos_spring[worldid, q_i + 1] = 0.0
         qpos_spring[worldid, q_i + 2] = 0.0
         qpos_spring[worldid, q_i + 3] = 0.0
+    elif type == JointType.CABLE:
+        pass
     else:
         axis_count = joint_dof_dim[jntid, 0] + joint_dof_dim[jntid, 1]
         for i in range(axis_count):
@@ -823,6 +829,8 @@ def apply_mjc_qfrc_kernel(
         qfrc_applied[worldid, qd_i + 0] = joint_f[wqd_i + 0]
         qfrc_applied[worldid, qd_i + 1] = joint_f[wqd_i + 1]
         qfrc_applied[worldid, qd_i + 2] = joint_f[wqd_i + 2]
+    elif jtype == JointType.CABLE:
+        pass
     else:
         for i in range(joint_dof_dim[jntid, 0] + joint_dof_dim[jntid, 1]):
             qfrc_applied[worldid, qd_i + i] = joint_f[wqd_i + i]

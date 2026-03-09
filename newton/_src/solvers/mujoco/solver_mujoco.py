@@ -2935,8 +2935,27 @@ class SolverMuJoCo(SolverBase):
             device=model.device,
         )
         if not is_mjwarp:
-            mj_data.qpos[:] = qpos.numpy().flatten()[: len(mj_data.qpos)]
-            mj_data.qvel[:] = qvel.numpy().flatten()[: len(mj_data.qvel)]
+            # NEW: filter out cable values
+            qpos_flat = qpos.numpy().flatten()
+            qvel_flat = qvel.numpy().flatten()
+
+            joint_type = model.joint_type.numpy()
+            joint_q_start = model.joint_q_start.numpy()
+            joint_qd_start = model.joint_qd_start.numpy()
+            joint_dof_dim = model.joint_dof_dim.numpy()
+
+            id_delta = 0
+            for j in range(joint_type.shape[0]):
+                if joint_type[j] == JointType.CABLE:
+                    id_delta += joint_dof_dim[j][0] + joint_dof_dim[j][1]
+                else:
+                    qpos_flat[joint_q_start[j]-id_delta:joint_q_start[j+1]-id_delta] = \
+                        qpos_flat[joint_q_start[j]:joint_q_start[j+1]]
+                    qvel_flat[joint_qd_start[j]-id_delta:joint_qd_start[j+1]-id_delta] = \
+                        qvel_flat[joint_qd_start[j]:joint_qd_start[j+1]]
+
+            mj_data.qpos[:] = qpos_flat[: len(mj_data.qpos)]
+            mj_data.qvel[:] = qvel_flat[: len(mj_data.qvel)]
 
     def _update_newton_state(
         self,
@@ -3493,6 +3512,15 @@ class SolverMuJoCo(SolverBase):
         shape_mu_torsional = model.shape_material_mu_torsional.numpy()
         shape_mu_rolling = model.shape_material_mu_rolling.numpy()
         shape_thickness = model.shape_thickness.numpy()
+
+        # NEW: change joint_dof_dim and joint_qd_start to deal with cables
+        first_cable_idx = None
+        for j in range(joint_type.shape[0]):
+            if joint_type[j] == JointType.CABLE:
+                if first_cable_idx is None:
+                    first_cable_idx = j
+                joint_dof_dim[j] = [0, 0]  # Cables have no DOFs
+                joint_qd_start[j] = joint_qd_start[first_cable_idx]  # Point to the first cable's DOFs
 
         # retrieve MuJoCo-specific attributes
         mujoco_attrs = getattr(model, "mujoco", None)
@@ -4210,6 +4238,9 @@ class SolverMuJoCo(SolverBase):
 
                         # Note: MuJoCo general actuators are handled separately via custom attributes
 
+            elif j_type == JointType.CABLE:
+                pass
+
             elif j_type != JointType.FIXED:
                 raise NotImplementedError(f"Joint type {j_type} is not supported yet")
 
@@ -4485,9 +4516,9 @@ class SolverMuJoCo(SolverBase):
 
             # Map each Newton body to the qd_start of its free/DISTANCE joint (or -1).
             # Use selected_joints as the template and tile offsets across worlds.
-            joint_type_np = model.joint_type.numpy()
-            joint_child_np = model.joint_child.numpy()
-            joint_qd_start_np = model.joint_qd_start.numpy()
+            joint_type_np = joint_type
+            joint_child_np = joint_child
+            joint_qd_start_np = joint_qd_start
 
             template_joint_types = joint_type_np[selected_joints]
             free_mask = np.isin(template_joint_types, (JointType.FREE, JointType.DISTANCE))

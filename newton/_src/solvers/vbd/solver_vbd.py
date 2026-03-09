@@ -614,11 +614,10 @@ class SolverVBD(SolverBase):
                 elif jt[j] == JointType.FIXED:
                     dim_np[j] = 2
                 else:
-                    if jt[j] != JointType.FREE:
-                        raise NotImplementedError(
-                            f"SolverVBD rigid joints: JointType.{JointType(jt[j]).name} is not implemented yet "
-                            "(only CABLE, BALL, and FIXED are supported)."
-                        )
+                    # FREE joints and unsupported articulated types (REVOLUTE, PRISMATIC, D6, …)
+                    # all get 0 constraint scalars.  Unsupported types are assumed to belong to
+                    # kinematic bodies (body_inv_mass == 0) whose poses are driven externally
+                    # (e.g. by MuJoCo); VBD will skip integration for those bodies automatically.
                     dim_np[j] = 0
 
             start_np = np.zeros((n_j,), dtype=np.int32)
