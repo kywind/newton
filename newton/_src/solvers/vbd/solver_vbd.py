@@ -498,6 +498,10 @@ class SolverVBD(SolverBase):
                 device=self.device,
             )
 
+            # NEW: handle for setting externally (mujoco) stepped rigid body to kinematic
+            self.body_inv_mass = wp.zeros((model.body_count,), dtype=float, device=self.device)
+            wp.copy(self.body_inv_mass, model.body_inv_mass)
+
             # AVBD constraint penalties
             # Joint constraint layout + penalties (solver constraint scalars)
             self._init_joint_constraint_layout()
@@ -619,6 +623,28 @@ class SolverVBD(SolverBase):
                     # kinematic bodies (body_inv_mass == 0) whose poses are driven externally
                     # (e.g. by MuJoCo); VBD will skip integration for those bodies automatically.
                     dim_np[j] = 0
+
+            # NEW: set inv masses of bodies in unsupported joint types to zero so they are kinematic and effectively skip VBD integration.
+            @wp.kernel
+            def _set_kinematic_bodies(
+                body_inv_mass: wp.array(dtype=float),
+                joint_type: wp.array(dtype=int),
+                joint_parent: wp.array(dtype=int),
+                joint_child: wp.array(dtype=int),
+            ):
+                j = wp.tid()
+                jt = joint_type[j]
+                if jt == JointType.PRISMATIC or jt == JointType.REVOLUTE or jt == JointType.D6:
+                    # These articulated joint types are not currently supported by SolverVBD, so we treat them as kinematic (zero inverse mass) bodies.
+                    body_inv_mass[joint_parent[j]] = 0.0
+                    body_inv_mass[joint_child[j]] = 0.0
+
+            wp.launch(
+                _set_kinematic_bodies,
+                dim=n_j,
+                inputs=[self.body_inv_mass, self.model.joint_type, self.model.joint_parent, self.model.joint_child],
+                device=self.device,
+            )
 
             start_np = np.zeros((n_j,), dtype=np.int32)
             c = 0
@@ -1332,7 +1358,7 @@ class SolverVBD(SolverBase):
                     state_in.body_f,
                     model.body_com,
                     model.body_inertia,
-                    model.body_inv_mass,
+                    self.body_inv_mass,
                     model.body_inv_inertia,
                     state_in.body_q,  # input/output
                     state_in.body_qd,  # input/output
@@ -1758,7 +1784,7 @@ class SolverVBD(SolverBase):
                         state_in.body_q,
                         state_in.body_qd,
                         model.body_com,
-                        model.body_inv_mass,
+                        self.body_inv_mass,
                         # AVBD body-particle soft contact penalties and material properties
                         self.friction_epsilon,
                         self.body_particle_contact_penalty_k,
@@ -1800,7 +1826,7 @@ class SolverVBD(SolverBase):
                         self.body_q_prev,
                         state_in.body_q,
                         model.body_com,
-                        model.body_inv_mass,
+                        self.body_inv_mass,
                         self.friction_epsilon,
                         self.body_body_contact_penalty_k,
                         self.body_body_contact_material_kd,
@@ -1837,7 +1863,7 @@ class SolverVBD(SolverBase):
                     self.body_q_prev,
                     model.body_q,
                     model.body_mass,
-                    model.body_inv_mass,
+                    self.body_inv_mass,
                     model.body_inertia,
                     self.body_inertia_q,
                     model.body_com,
