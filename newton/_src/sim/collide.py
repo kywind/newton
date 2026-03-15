@@ -566,7 +566,7 @@ class CollisionPipeline:
             # Pass write_contact as custom writer to write directly to final Contacts format
             self.narrow_phase = NarrowPhase(
                 max_candidate_pairs=self.shape_pairs_max,
-                max_triangle_pairs=1000000,
+                max_triangle_pairs=10_000_000,
                 reduce_contacts=self.reduce_contacts,
                 device=device,
                 shape_aabb_lower=shape_aabb_lower,
