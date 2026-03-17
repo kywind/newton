@@ -1332,6 +1332,32 @@ def warmstart_body_body_contacts(
 
 
 @wp.kernel
+def override_contact_mu_by_group(
+    rigid_contact_count: wp.array(dtype=int),
+    rigid_contact_shape0: wp.array(dtype=int),
+    rigid_contact_shape1: wp.array(dtype=int),
+    shape_group: wp.array(dtype=wp.int32),
+    override_mu: float,
+    contact_material_mu: wp.array(dtype=float),
+):
+    """Override contact friction for specific shape group pairs after warmstart.
+
+    Shapes labelled group=1 (finger) contacting group=2 (cable) get their
+    contact_material_mu replaced with override_mu, regardless of what the
+    geometric-mean warmstart computed.
+    """
+    i = wp.tid()
+    if i >= rigid_contact_count[0]:
+        return
+    s0 = rigid_contact_shape0[i]
+    s1 = rigid_contact_shape1[i]
+    g0 = shape_group[s0]
+    g1 = shape_group[s1]
+    if (g0 == wp.int32(1) and g1 == wp.int32(2)) or (g0 == wp.int32(2) and g1 == wp.int32(1)):
+        contact_material_mu[i] = override_mu
+
+
+@wp.kernel
 def warmstart_body_particle_contacts(
     body_particle_contact_count: wp.array(dtype=int),
     body_particle_contact_shape: wp.array(dtype=int),

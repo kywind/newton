@@ -81,6 +81,7 @@ from .rigid_vbd_kernels import (
     update_duals_body_body_contacts,  # Body-body (rigid-rigid) contacts (AVBD penalty update)
     update_duals_body_particle_contacts,  # Body-particle soft contacts (AVBD penalty update)
     update_duals_joint,  # Cable joints (AVBD penalty update)
+    override_contact_mu_by_group,   # Per-group contact friction override (post-warmstart)
     warmstart_body_body_contacts,  # Body-body (rigid-rigid) contacts (penalty warmstart)
     warmstart_body_particle_contacts,  # Body-particle soft contacts (penalty warmstart)
     warmstart_joints,  # Cable joints (stretch & bend)
@@ -177,6 +178,10 @@ class SolverVBD(SolverBase):
         rigid_body_contact_buffer_size: int = 64,
         rigid_body_particle_contact_buffer_size: int = 256,
         rigid_enable_dahl_friction: bool = False,  # Cable bending plasticity/hysteresis
+        # Per-contact-pair friction override: shapes labelled 1 (finger) ↔ 2 (cable)
+        # get their contact mu replaced with finger_cable_mu after warmstart.
+        shape_group: "wp.array | None" = None,
+        finger_cable_mu: float = 7.07,
     ):
         """
         Args:
@@ -269,6 +274,8 @@ class SolverVBD(SolverBase):
         # Common parameters
         self.iterations = iterations
         self.friction_epsilon = friction_epsilon
+        self._shape_group = shape_group
+        self._finger_cable_mu = finger_cable_mu
 
         # Rigid integration mode: when True, rigid bodies are integrated by an external
         # solver (one-way coupling). SolverVBD will not move rigid bodies, but can still
@@ -1418,6 +1425,23 @@ class SolverVBD(SolverBase):
                         dim=contact_launch_dim,
                         device=self.device,
                     )
+
+                    # Per-group friction override: replace warmstart mu for
+                    # finger(1)↔cable(2) contacts with the configured value.
+                    if self._shape_group is not None:
+                        wp.launch(
+                            kernel=override_contact_mu_by_group,
+                            inputs=[
+                                contacts.rigid_contact_count,
+                                contacts.rigid_contact_shape0,
+                                contacts.rigid_contact_shape1,
+                                self._shape_group,
+                                self._finger_cable_mu,
+                                self.body_body_contact_material_mu,
+                            ],
+                            dim=contact_launch_dim,
+                            device=self.device,
+                        )
 
                 # Warmstart AVBD penalty parameters for joints using the same cadence
                 # as rigid history updates.
