@@ -41,7 +41,7 @@ github_version = os.environ.get("GITHUB_REF_NAME") or os.environ.get("CI_COMMIT_
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
 project = "Newton Physics"
-copyright = f"{datetime.date.today().year}, The Newton Developers"
+copyright = f"{datetime.date.today().year}, The Newton Developers. Documentation licensed under CC-BY-4.0"
 author = "The Newton Developers"
 
 # Read version from _version.py
@@ -161,6 +161,8 @@ autodoc_preserve_defaults = True
 
 autodoc_typehints_description_target = "documented"
 
+toc_object_entries_show_parents = "hide"
+
 autodoc_default_options = {
     "members": True,
     "member-order": "groupwise",
@@ -211,6 +213,13 @@ html_theme_options = {
         "text": f"Newton Physics <span style='font-size: 0.8em; color: #888;'>({release})</span>",
         "alt_text": "Newton Physics Logo",
     },
+    # Keep the right-hand page TOC on by default, but remove it on the
+    # solver API page where several wide comparison tables benefit from the
+    # extra content width.
+    "secondary_sidebar_items": {
+        "**": ["page-toc", "edit-this-page", "sourcelink"],
+        "api/newton_solvers": [],
+    },
     # "primary_sidebar_end": ["indices.html", "sidebar-ethical-ads.html"],
 }
 
@@ -232,6 +241,10 @@ html_theme_options["switcher"] = {
 
 # Add version switcher to navbar
 html_theme_options["navbar_end"] = ["theme-switcher", "version-switcher", "navbar-icon-links"]
+
+# Footer configuration — show copyright (includes CC-BY-4.0 notice)
+html_theme_options["footer_start"] = ["copyright"]
+html_theme_options["footer_end"] = ["theme-version"]
 
 # Disable switcher JSON validation during local builds (file not accessible locally)
 if not _is_ci:

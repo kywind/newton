@@ -22,7 +22,7 @@ from newton.solvers import SolverImplicitMPM
 
 
 class Example:
-    def __init__(self, viewer, options):
+    def __init__(self, viewer, args):
         # setup simulation parameters first
         self.fps = 60.0
         self.frame_dt = 1.0 / self.fps
@@ -39,7 +39,7 @@ class Example:
         # Register MPM custom attributes before adding particles
         SolverImplicitMPM.register_custom_attributes(builder)
 
-        sand_particles, snow_particles, mud_particles = Example.emit_particles(builder, voxel_size=options.voxel_size)
+        sand_particles, snow_particles, mud_particles = Example.emit_particles(builder, voxel_size=args.voxel_size)
 
         builder.add_ground_plane()
         self.model = builder.finalize()
@@ -63,10 +63,10 @@ class Example:
         self.model.mpm.hardening[mud_particles].fill_(2.0)
         self.model.mpm.friction[mud_particles].fill_(0.0)
 
-        mpm_options = SolverImplicitMPM.Options()
-        mpm_options.voxel_size = options.voxel_size
-        mpm_options.tolerance = options.tolerance
-        mpm_options.max_iterations = options.max_iterations
+        mpm_options = SolverImplicitMPM.Config()
+        mpm_options.voxel_size = args.voxel_size
+        mpm_options.tolerance = args.tolerance
+        mpm_options.max_iterations = args.max_iterations
 
         # Initialize MPM solver
         self.solver = SolverImplicitMPM(self.model, mpm_options)
@@ -88,7 +88,7 @@ class Example:
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
             self.solver.step(self.state_0, self.state_1, None, None, self.sim_dt)
-            self.solver.project_outside(self.state_1, self.state_1, self.sim_dt)
+            self.solver._project_outside(self.state_1, self.state_1, self.sim_dt)
             self.state_0, self.state_1 = self.state_1, self.state_0
 
     def step(self):
@@ -190,16 +190,18 @@ class Example:
         end_id = len(builder.particle_q)
         return np.arange(begin_id, end_id, dtype=int)
 
+    @staticmethod
+    def create_parser():
+        parser = newton.examples.create_parser()
+        parser.add_argument("--max-iterations", "-it", type=int, default=250)
+        parser.add_argument("--tolerance", "-tol", type=float, default=1.0e-6)
+        parser.add_argument("--voxel-size", "-dx", type=float, default=0.05)
+        return parser
+
 
 if __name__ == "__main__":
-    # Create parser that inherits common arguments and adds example-specific ones
-    parser = newton.examples.create_parser()
+    parser = Example.create_parser()
 
-    parser.add_argument("--max-iterations", "-it", type=int, default=250)
-    parser.add_argument("--tolerance", "-tol", type=float, default=1.0e-6)
-    parser.add_argument("--voxel-size", "-dx", type=float, default=0.05)
-
-    # Parse arguments and initialize viewer
     viewer, args = newton.examples.init(parser)
 
     # Create example and run

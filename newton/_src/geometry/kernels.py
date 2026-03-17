@@ -15,6 +15,7 @@
 
 import warp as wp
 
+from ..utils.heightfield import HeightfieldData, sample_sdf_grad_heightfield
 from .broad_phase_common import binary_search
 from .flags import ParticleFlags, ShapeFlags
 from .types import (
@@ -1027,6 +1028,9 @@ def create_soft_contacts(
     soft_contact_max: int,
     shape_count: int,
     shape_flags: wp.array(dtype=wp.int32),
+    shape_heightfield_index: wp.array(dtype=wp.int32),
+    heightfield_data: wp.array(dtype=HeightfieldData),
+    heightfield_elevations: wp.array(dtype=wp.float32),
     # outputs
     soft_contact_count: wp.array(dtype=int),
     soft_contact_particle: wp.array(dtype=int),
@@ -1128,6 +1132,10 @@ def create_soft_contacts(
     if geo_type == GeoType.PLANE:
         d = sdf_plane(x_local, geo_scale[0] * 0.5, geo_scale[1] * 0.5)
         n = wp.vec3(0.0, 0.0, 1.0)
+
+    if geo_type == GeoType.HFIELD:
+        hfd = heightfield_data[shape_heightfield_index[shape_index]]
+        d, n = sample_sdf_grad_heightfield(hfd, heightfield_elevations, x_local)
 
     if d < margin + radius:
         index = counter_increment(soft_contact_count, 0, soft_contact_tids, tid)

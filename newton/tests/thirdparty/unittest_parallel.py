@@ -31,6 +31,12 @@ import unittest
 from contextlib import contextmanager
 from io import StringIO
 
+# Work around a known OpenUSD thread-safety crash in
+# UsdPhysics.LoadUsdPhysicsFromRange for collider-dense assets. OpenUSD reads
+# this once when pxr initializes, so set it before test modules import pxr and
+# preserve any caller-provided override.
+os.environ.setdefault("PXR_WORK_THREAD_LIMIT", "1")
+
 from newton.tests.unittest_utils import (  # NVIDIA modification
     ParallelJunitTestResult,
     write_junit_results,
@@ -83,8 +89,8 @@ def main(argv=None):
         python -m newton.tests -k 'mgpu' -k 'cuda'
         """,
     )
-    # parser.add_argument("-v", "--verbose", action="store_const", const=2, default=1, help="Verbose output")
-    parser.add_argument("-q", "--quiet", dest="verbose", action="store_const", const=0, default=2, help="Quiet output")
+    parser.add_argument("-v", "--verbose", action="store_const", const=2, default=1, help="Verbose output")
+    parser.add_argument("-q", "--quiet", dest="verbose", action="store_const", const=0, default=1, help="Quiet output")
     parser.add_argument("-f", "--failfast", action="store_true", default=False, help="Stop on first fail or error")
     parser.add_argument(
         "-b", "--buffer", action="store_true", default=False, help="Buffer stdout and stderr during tests"
@@ -213,13 +219,18 @@ def main(argv=None):
     assets_to_download = [
         "anybotics_anymal_c",
         "anybotics_anymal_d",
+        "apptronik_apollo",
+        "booster_t1",
         "franka_emika_panda",
         "manipulation_objects/cup",  # Used in robot.example_robot_panda_hydro
         "manipulation_objects/pad",  # Used in robot.example_robot_panda_hydro
+        "robotiq_2f85_v4",
+        "shadow_hand",
         "unitree_go2",
         "unitree_g1",
         "unitree_h1",
         "style3d",
+        "universal_robots_ur5e",
         "universal_robots_ur10",
         "wonik_allegro",
     ]
@@ -231,15 +242,23 @@ def main(argv=None):
         args.maxjobs,
     )
 
-    # Pre-download mujoco_menagerie folders used by test_robot_composer
+    # Pre-download only the menagerie folders exercised by non-skipped
+    # menagerie tests and test_robot_composer. Placeholder USD stub classes
+    # without usd_asset_folder now skip before any menagerie download occurs.
     from newton._src.utils.download_assets import download_git_folder  # noqa: PLC0415
 
     menagerie_url = "https://github.com/google-deepmind/mujoco_menagerie.git"
     menagerie_folders = [
-        "universal_robots_ur5e",
+        "apptronik_apollo",
+        "booster_t1",
         "leap_hand",
-        "wonik_allegro",
         "robotiq_2f85",
+        "robotiq_2f85_v4",
+        "shadow_hand",
+        "unitree_g1",
+        "unitree_h1",
+        "universal_robots_ur5e",
+        "wonik_allegro",
     ]
     # Passing args.maxjobs to respect CLI cap for parallelism.
     _parallel_download(
@@ -571,38 +590,55 @@ class ParallelTextTestResult(unittest.TextTestResult):
         if self.showAll:
             self.stream.writeln(f"{self.getDescription(test)} ...")
             self.stream.flush()
+        elif self.dots:
+            self.stream.writeln(f"{test} ...")
+            self.stream.flush()
         super(unittest.TextTestResult, self).startTest(test)
 
-    def _add_helper(self, test, dots_message, show_all_message):
+    def stopTest(self, test):
+        super().stopTest(test)
+        # Force garbage collection of CPU-side allocations and release unused
+        # CUDA mempool memory to reduce peak host RSS in parallel test runs
+        # (see issue #1881).
+        import gc  # noqa: PLC0415
+
+        gc.collect()
+        import warp as wp  # noqa: PLC0415
+
+        for device_name in wp.get_cuda_devices():
+            if wp.is_mempool_enabled(device_name):
+                wp.set_mempool_release_threshold(device_name, 0)
+
+    def _add_helper(self, test, show_all_message):
         if self.showAll:
             self.stream.writeln(f"{self.getDescription(test)} ... {show_all_message}")
         elif self.dots:
-            self.stream.write(dots_message)
+            self.stream.writeln(f"{test} ... {show_all_message}")
         self.stream.flush()
 
     def addSuccess(self, test):
         super(unittest.TextTestResult, self).addSuccess(test)
-        self._add_helper(test, ".", "ok")
+        self._add_helper(test, "ok")
 
     def addError(self, test, err):
         super(unittest.TextTestResult, self).addError(test, err)
-        self._add_helper(test, "E", "ERROR")
+        self._add_helper(test, "ERROR")
 
     def addFailure(self, test, err):
         super(unittest.TextTestResult, self).addFailure(test, err)
-        self._add_helper(test, "F", "FAIL")
+        self._add_helper(test, "FAIL")
 
     def addSkip(self, test, reason):
         super(unittest.TextTestResult, self).addSkip(test, reason)
-        self._add_helper(test, "s", f"skipped {reason!r}")
+        self._add_helper(test, f"skipped {reason!r}")
 
     def addExpectedFailure(self, test, err):
         super(unittest.TextTestResult, self).addExpectedFailure(test, err)
-        self._add_helper(test, "x", "expected failure")
+        self._add_helper(test, "expected failure")
 
     def addUnexpectedSuccess(self, test):
         super(unittest.TextTestResult, self).addUnexpectedSuccess(test)
-        self._add_helper(test, "u", "unexpected success")
+        self._add_helper(test, "unexpected success")
 
     def printErrors(self):
         pass

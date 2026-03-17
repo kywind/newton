@@ -17,13 +17,13 @@ import contextlib
 import os
 import warnings
 from collections import defaultdict
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import warp as wp
 
 from ..core.types import Vec3, nparray
-from .inertia import compute_mesh_inertia
+from .inertia import compute_inertia_mesh
 from .types import (
     GeoType,
     Heightfield,
@@ -114,6 +114,15 @@ def compute_shape_radius(geo_type: int, scale: Vec3, src: Mesh | Heightfield | N
             return np.sqrt(half_x**2 + half_y**2 + half_z**2)
         else:
             return np.linalg.norm(scale)
+    elif geo_type == GeoType.GAUSSIAN:
+        if src is not None:
+            lower, upper = src.compute_aabb()
+            scale_arr = np.abs(np.asarray(scale, dtype=np.float32))
+            vmax = np.maximum(np.abs(lower), np.abs(upper)) * scale_arr
+            if hasattr(src, "scales") and len(src.scales) > 0:
+                vmax = vmax + np.max(np.abs(src.scales), axis=0) * scale_arr
+            return float(np.linalg.norm(vmax))
+        return 10.0
     else:
         return 10.0
 
@@ -123,6 +132,74 @@ def compute_aabb(vertices: nparray) -> tuple[Vec3, Vec3]:
     min_coords = np.min(vertices, axis=0)
     max_coords = np.max(vertices, axis=0)
     return min_coords, max_coords
+
+
+def compute_inertia_box_mesh(
+    vertices: nparray,
+    indices: nparray,
+    is_solid: bool = True,
+) -> tuple[wp.vec3, wp.vec3, wp.quat]:
+    """Compute the equivalent inertia box of a triangular mesh.
+
+    The equivalent inertia box is the box whose inertia tensor matches that of
+    the mesh.  Unlike a bounding box it does **not** necessarily enclose the
+    geometry — it characterises the mass distribution.
+
+    The half-sizes are derived from the principal inertia eigenvalues
+    (*I₀*, *I₁*, *I₂*) and volume *V* of the mesh:
+
+    .. math::
+
+        h_i = \\tfrac{1}{2}\\sqrt{\\frac{6\\,(I_j + I_k - I_i)}{V}}
+
+    where *(i, j, k)* is a cyclic permutation of *(0, 1, 2)*.
+
+    Args:
+        vertices: Vertex positions, shape ``(N, 3)``.
+        indices: Triangle indices (flattened or ``(M, 3)``).
+        is_solid: If ``True`` treat the mesh as solid; otherwise as a thin
+            shell (see :func:`compute_inertia_mesh`).
+
+    Returns:
+        Tuple of ``(center, half_extents, rotation)`` where *center* is the
+        center of mass, *half_extents* are the box half-sizes along the
+        principal axes (not necessarily sorted), and *rotation* is the
+        quaternion rotating from the principal-axis frame to the mesh frame.
+    """
+    _mass, com, inertia_tensor, volume = compute_inertia_mesh(
+        density=1.0,
+        vertices=vertices.tolist() if isinstance(vertices, np.ndarray) else vertices,
+        indices=np.asarray(indices).flatten().tolist(),
+        is_solid=is_solid,
+    )
+
+    if volume < 1e-12:
+        return wp.vec3(0.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 0.0), wp.quat_identity()
+
+    inertia = np.array(inertia_tensor).reshape(3, 3)
+    eigvals, eigvecs = np.linalg.eigh(inertia)
+
+    # Sort eigenvalues (and eigenvectors) in ascending order.
+    order = np.argsort(eigvals)
+    eigvals = eigvals[order]
+    eigvecs = eigvecs[:, order]
+
+    # Ensure right-handed frame.
+    if np.linalg.det(eigvecs) < 0:
+        eigvecs[:, 0] = -eigvecs[:, 0]
+
+    # Derive equivalent box half-sizes from principal inertia eigenvalues.
+    half_extents = np.zeros(3)
+    for i in range(3):
+        j, k = (i + 1) % 3, (i + 2) % 3
+        arg = 6.0 * (eigvals[j] + eigvals[k] - eigvals[i]) / volume
+        half_extents[i] = 0.5 * np.sqrt(max(arg, 0.0))
+
+    # Convert the eigenvector matrix (columns = principal axes in mesh frame)
+    # to a quaternion.
+    rotation = wp.quat_from_matrix(wp.mat33(*eigvecs.T.flatten().tolist()))
+
+    return wp.vec3(*np.array(com)), wp.vec3(*half_extents), rotation
 
 
 def compute_pca_obb(vertices: nparray) -> tuple[wp.transform, wp.vec3]:
@@ -226,7 +303,7 @@ def compute_inertia_obb(
     hull_indices = hull_faces.flatten()
 
     # Step 2: Compute mesh inertia
-    _mass, com, inertia_tensor, _volume = compute_mesh_inertia(
+    _mass, com, inertia_tensor, _volume = compute_inertia_mesh(
         density=1.0,  # Unit density
         vertices=hull_vertices.tolist(),
         indices=hull_indices.tolist(),
@@ -430,7 +507,13 @@ def silence_stdio():
         devnull.close()
 
 
-def remesh_ftetwild(vertices, faces, optimize=False, edge_length_fac=0.05, verbose=False):
+def remesh_ftetwild(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    optimize: bool = False,
+    edge_length_fac: float = 0.05,
+    verbose: bool = False,
+):
     """Remesh a 3D triangular surface mesh using "Fast Tetrahedral Meshing in the Wild" (fTetWild).
 
     This is useful for improving the quality of the mesh, and for ensuring that the mesh is
@@ -497,7 +580,7 @@ def remesh_ftetwild(vertices, faces, optimize=False, edge_length_fac=0.05, verbo
     return new_vertices, new_faces
 
 
-def remesh_alphashape(vertices, alpha: float = 3.0):
+def remesh_alphashape(vertices: np.ndarray, alpha: float = 3.0):
     """Remesh a 3D triangular surface mesh using the alpha shape algorithm.
 
     Args:
@@ -515,7 +598,13 @@ def remesh_alphashape(vertices, alpha: float = 3.0):
     return np.array(alpha_shape.vertices), np.array(alpha_shape.faces, dtype=np.int32)
 
 
-def remesh_quadratic(vertices, faces, target_reduction=0.5, target_count=None, **kwargs):
+def remesh_quadratic(
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    target_reduction: float = 0.5,
+    target_count: int | None = None,
+    **kwargs: Any,
+):
     """Remesh a 3D triangular surface mesh using fast quadratic mesh simplification.
 
     https://github.com/pyvista/fast-simplification
@@ -534,7 +623,7 @@ def remesh_quadratic(vertices, faces, target_reduction=0.5, target_count=None, *
     return simplify(vertices, faces, target_reduction=target_reduction, target_count=target_count, **kwargs)
 
 
-def remesh_convex_hull(vertices, maxhullvert: int = 0):
+def remesh_convex_hull(vertices: np.ndarray, maxhullvert: int = 0):
     """Compute the convex hull of a set of 3D points and return the vertices and faces of the convex hull mesh.
 
     Uses ``scipy.spatial.ConvexHull`` to compute the convex hull.
@@ -582,7 +671,11 @@ RemeshingMethod = Literal["ftetwild", "alphashape", "quadratic", "convex_hull", 
 
 
 def remesh(
-    vertices, faces, method: RemeshingMethod = "quadratic", visualize=False, **remeshing_kwargs
+    vertices: np.ndarray,
+    faces: np.ndarray,
+    method: RemeshingMethod = "quadratic",
+    visualize: bool = False,
+    **remeshing_kwargs: Any,
 ) -> tuple[nparray, nparray]:
     """
     Remeshes a 3D triangular surface mesh using the specified method.
@@ -630,19 +723,19 @@ def remesh_mesh(
     method: RemeshingMethod = "quadratic",
     recompute_inertia: bool = False,
     inplace: bool = False,
-    **remeshing_kwargs,
+    **remeshing_kwargs: Any,
 ) -> Mesh:
     """
     Remeshes a Mesh object using the specified remeshing method.
 
     Args:
-        mesh (Mesh): The mesh to be remeshed.
-        method (RemeshingMethod, optional): The remeshing method to use.
+        mesh: The mesh to be remeshed.
+        method: The remeshing method to use.
             One of "ftetwild", "quadratic", "convex_hull", "alphashape", or "poisson".
             Defaults to "quadratic".
-        recompute_inertia (bool, optional): If True, recompute the mass, center of mass,
+        recompute_inertia: If True, recompute the mass, center of mass,
             and inertia tensor of the mesh after remeshing. Defaults to False.
-        inplace (bool, optional): If True, modify the mesh in place. If False,
+        inplace: If True, modify the mesh in place. If False,
             return a new mesh instance with the remeshed geometry. Defaults to False.
         **remeshing_kwargs: Additional keyword arguments passed to the remeshing function.
 
@@ -656,7 +749,7 @@ def remesh_mesh(
         mesh.vertices = vertices
         mesh.indices = indices.flatten()
         if recompute_inertia:
-            mesh.mass, mesh.com, mesh.I, _ = compute_mesh_inertia(1.0, vertices, indices, is_solid=mesh.is_solid)
+            mesh.mass, mesh.com, mesh.inertia, _ = compute_inertia_mesh(1.0, vertices, indices, is_solid=mesh.is_solid)
     else:
         return mesh.copy(vertices=vertices, indices=indices, recompute_inertia=recompute_inertia)
     return mesh
@@ -705,7 +798,12 @@ def scan_with_total(
         total: Single-element output array that will contain the sum of all counts.
     """
     wp.utils.array_scan(counts, prefix_sums, inclusive=False)
-    wp.launch(get_total_kernel, dim=[1], inputs=[counts, prefix_sums, num_elements, counts.shape[0], total])
+    wp.launch(
+        get_total_kernel,
+        dim=[1],
+        inputs=[counts, prefix_sums, num_elements, counts.shape[0], total],
+        device=counts.device,
+    )
 
 
 __all__ = ["compute_shape_radius", "load_mesh", "visualize_meshes"]

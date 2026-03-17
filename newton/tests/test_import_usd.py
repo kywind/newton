@@ -15,6 +15,7 @@
 
 import math
 import os
+import tempfile
 import unittest
 from unittest import mock
 
@@ -24,12 +25,12 @@ import warp as wp
 import newton
 import newton.examples
 import newton.usd as usd
-from newton import JointType
+from newton import BodyFlags, JointType
 from newton._src.geometry.flags import ShapeFlags
 from newton._src.geometry.utils import transform_points
+from newton.math import quat_between_axes
 from newton.solvers import SolverMuJoCo
 from newton.tests.unittest_utils import USD_AVAILABLE, assert_np_equal, get_test_devices
-from newton.utils import quat_between_axes
 
 devices = get_test_devices()
 
@@ -237,6 +238,81 @@ def Xform "Root" (
         # finalize requires skip_validation_joints=True for orphan joints
         model = builder.finalize(skip_validation_joints=True)
         self.assertEqual(model.body_count, 4)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_body_to_world_fixed_joint(self):
+        """A body connected to the world via a PhysicsFixedJoint must be imported
+        with a FIXED joint (not FREE) and placed in its own articulation."""
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        # Main articulation: two bodies with a revolute joint.
+        arm = UsdGeom.Xform.Define(stage, "/World/Arm")
+        UsdPhysics.ArticulationRootAPI.Apply(arm.GetPrim())
+
+        base = UsdGeom.Xform.Define(stage, "/World/Arm/Base")
+        UsdPhysics.RigidBodyAPI.Apply(base.GetPrim())
+        base.AddTranslateOp().Set(Gf.Vec3d(0, 0, 0))
+        col_base = UsdGeom.Cube.Define(stage, "/World/Arm/Base/Collision")
+        UsdPhysics.CollisionAPI.Apply(col_base.GetPrim())
+
+        link1 = UsdGeom.Xform.Define(stage, "/World/Arm/Link1")
+        UsdPhysics.RigidBodyAPI.Apply(link1.GetPrim())
+        link1.AddTranslateOp().Set(Gf.Vec3d(1, 0, 0))
+        col_link1 = UsdGeom.Cube.Define(stage, "/World/Arm/Link1/Collision")
+        UsdPhysics.CollisionAPI.Apply(col_link1.GetPrim())
+
+        rev = UsdPhysics.RevoluteJoint.Define(stage, "/World/Arm/RevJoint")
+        rev.CreateBody0Rel().SetTargets([base.GetPath()])
+        rev.CreateBody1Rel().SetTargets([link1.GetPath()])
+        rev.CreateLocalPos0Attr().Set(Gf.Vec3f(0.5, 0, 0))
+        rev.CreateLocalPos1Attr().Set(Gf.Vec3f(-0.5, 0, 0))
+        rev.CreateLocalRot0Attr().Set(Gf.Quatf(1, 0, 0, 0))
+        rev.CreateLocalRot1Attr().Set(Gf.Quatf(1, 0, 0, 0))
+        rev.CreateAxisAttr().Set("Z")
+
+        # world_link: a rigid body fixed-jointed to the world (body0 unset = world).
+        wl = UsdGeom.Xform.Define(stage, "/World/WorldLink")
+        UsdPhysics.RigidBodyAPI.Apply(wl.GetPrim())
+        wl.AddTranslateOp().Set(Gf.Vec3d(0, 0, 0))
+        col_wl = UsdGeom.Cube.Define(stage, "/World/WorldLink/Collision")
+        UsdPhysics.CollisionAPI.Apply(col_wl.GetPrim())
+
+        fixed = UsdPhysics.FixedJoint.Define(stage, "/World/WorldLink/FixedJoint")
+        fixed.CreateBody1Rel().SetTargets([wl.GetPath()])
+        fixed.CreateLocalPos0Attr().Set(Gf.Vec3f(0, 0, 0))
+        fixed.CreateLocalPos1Attr().Set(Gf.Vec3f(0, 0, 0))
+        fixed.CreateLocalRot0Attr().Set(Gf.Quatf(1, 0, 0, 0))
+        fixed.CreateLocalRot1Attr().Set(Gf.Quatf(1, 0, 0, 0))
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(stage)
+
+        # 3 bodies: Base, Link1, WorldLink.
+        self.assertEqual(builder.body_count, 3)
+
+        wl_body_idx = builder.body_label.index("/World/WorldLink")
+        wl_joint_idx = next(i for i in range(builder.joint_count) if builder.joint_child[i] == wl_body_idx)
+
+        # world_link must have a FIXED joint, not a FREE joint.
+        self.assertEqual(builder.joint_type[wl_joint_idx], newton.JointType.FIXED)
+        # Parent is -1 (world).
+        self.assertEqual(builder.joint_parent[wl_joint_idx], -1)
+        # world_link's FIXED joint must belong to its own articulation,
+        # separate from the main arm articulation.
+        wl_art = builder.joint_articulation[wl_joint_idx]
+        self.assertNotEqual(wl_art, -1)
+
+        rev_joint_idx = builder.joint_label.index("/World/Arm/RevJoint")
+        arm_art = builder.joint_articulation[rev_joint_idx]
+        self.assertNotEqual(wl_art, arm_art)
+
+        # Model must finalize without errors (no orphan joint issues).
+        model = builder.finalize()
+        self.assertEqual(model.body_count, 3)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_collapse_fixed_joints_preserves_orphan_joints(self):
@@ -1166,6 +1242,110 @@ class TestImportUsdPhysics(unittest.TestCase):
         )
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_mass_fallback_instanced_colliders(self):
+        """Regression test: bodies with PhysicsMassAPI but no authored mass properties
+        and instanceable collision shapes must get positive mass from shape accumulation.
+
+        When collision shapes live inside instanceable prims, USD's
+        ComputeMassProperties cannot traverse into them and returns invalid results
+        (mass < 0). The importer must fall back to the mass properties already
+        accumulated by the builder during add_shape_*() calls, and respect the
+        body-level authored density instead of the builder's default shape density.
+        """
+        from pxr import Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        # Create a prototype with a collision sphere (outside the body hierarchy).
+        stage.OverridePrim("/Prototype_Collisions")
+        radius = 0.5
+        sphere = UsdGeom.Sphere.Define(stage, "/Prototype_Collisions/sphere")
+        sphere.CreateRadiusAttr().Set(radius)
+        UsdPhysics.CollisionAPI.Apply(sphere.GetPrim())
+
+        # Create a rigid body with MassAPI applied and only density authored.
+        body_density = 5.0
+        body_xform = UsdGeom.Xform.Define(stage, "/World/Body")
+        body_prim = body_xform.GetPrim()
+        UsdPhysics.RigidBodyAPI.Apply(body_prim)
+        mass_api = UsdPhysics.MassAPI.Apply(body_prim)
+        mass_api.CreateDensityAttr().Set(body_density)
+
+        # Reference the collision prototype as an instanceable prim.
+        collisions = stage.DefinePrim("/World/Body/collisions")
+        collisions.GetReferences().AddInternalReference("/Prototype_Collisions")
+        collisions.SetInstanceable(True)
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(stage)
+
+        self.assertEqual(builder.body_count, 1)
+        # Expected mass = body_density * sphere_volume = 5 * (4/3 * pi * 0.5^3).
+        expected_mass = body_density * (4.0 / 3.0 * np.pi * radius**3)
+        np.testing.assert_allclose(builder.body_mass[0], expected_mass, rtol=1e-5)
+        # Verify inertia is also positive (not garbage).
+        inertia = np.array(builder.body_inertia[0]).reshape(3, 3)
+        self.assertGreater(np.trace(inertia), 0.0, "Body inertia trace must be positive")
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_kinematic_enabled_flag(self):
+        """USD bodies with physics:kinematicEnabled=true get BodyFlags.KINEMATIC."""
+        from pxr import Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        # Kinematic root body
+        kin_xform = UsdGeom.Xform.Define(stage, "/World/Kinematic")
+        kin_prim = kin_xform.GetPrim()
+        rb_api = UsdPhysics.RigidBodyAPI.Apply(kin_prim)
+        rb_api.CreateKinematicEnabledAttr().Set(True)
+        mass_api = UsdPhysics.MassAPI.Apply(kin_prim)
+        mass_api.CreateMassAttr().Set(1.0)
+        sphere = UsdGeom.Sphere.Define(stage, "/World/Kinematic/Sphere")
+        UsdPhysics.CollisionAPI.Apply(sphere.GetPrim())
+
+        # Dynamic body
+        dyn_xform = UsdGeom.Xform.Define(stage, "/World/Dynamic")
+        dyn_prim = dyn_xform.GetPrim()
+        UsdPhysics.RigidBodyAPI.Apply(dyn_prim)
+        mass_api2 = UsdPhysics.MassAPI.Apply(dyn_prim)
+        mass_api2.CreateMassAttr().Set(1.0)
+        sphere2 = UsdGeom.Sphere.Define(stage, "/World/Dynamic/Sphere")
+        UsdPhysics.CollisionAPI.Apply(sphere2.GetPrim())
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(stage)
+
+        kin_idx = builder.body_label.index("/World/Kinematic")
+        dyn_idx = builder.body_label.index("/World/Dynamic")
+        self.assertTrue(builder.body_flags[kin_idx] & int(BodyFlags.KINEMATIC))
+        self.assertEqual(builder.body_flags[dyn_idx], int(BodyFlags.DYNAMIC))
+
+        model = builder.finalize()
+        flags = model.body_flags.numpy()
+        self.assertTrue(flags[kin_idx] & int(BodyFlags.KINEMATIC))
+        self.assertEqual(flags[dyn_idx], int(BodyFlags.DYNAMIC))
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_kinematic_enabled_articulation(self):
+        """Kinematic flag is parsed for articulation root bodies from USD."""
+        builder = newton.ModelBuilder()
+        builder.add_usd(os.path.join(os.path.dirname(__file__), "assets", "actuator_test.usda"))
+
+        base_idx = builder.body_label.index("/World/Robot/Base")
+        self.assertTrue(builder.body_flags[base_idx] & int(BodyFlags.KINEMATIC))
+
+        # Non-root links should be dynamic
+        link1_idx = builder.body_label.index("/World/Robot/Link1")
+        link2_idx = builder.body_label.index("/World/Robot/Link2")
+        self.assertEqual(builder.body_flags[link1_idx], int(BodyFlags.DYNAMIC))
+        self.assertEqual(builder.body_flags[link2_idx], int(BodyFlags.DYNAMIC))
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_import_cube_cylinder_joint_count(self):
         builder = newton.ModelBuilder()
         import_results = builder.add_usd(
@@ -1597,7 +1777,7 @@ def Xform "Articulation" (
         joint1.CreateAxisAttr().Set("Z")
         joint1.CreateBody0Rel().SetTargets([body1_path])
         joint1_prim = joint1.GetPrim()
-        joint1_prim.CreateAttribute("mjc:margin", Sdf.ValueTypeNames.FloatArray, True).Set([0.01])
+        joint1_prim.CreateAttribute("mjc:margin", Sdf.ValueTypeNames.Double).Set(0.01)
 
         # Create second body with joint
         body2_path = "/body2"
@@ -1612,7 +1792,7 @@ def Xform "Articulation" (
         joint2.CreateBody0Rel().SetTargets([body1_path])
         joint2.CreateBody1Rel().SetTargets([body2_path])
         joint2_prim = joint2.GetPrim()
-        joint2_prim.CreateAttribute("mjc:margin", Sdf.ValueTypeNames.FloatArray, True).Set([0.02])
+        joint2_prim.CreateAttribute("mjc:margin", Sdf.ValueTypeNames.Double).Set(0.02)
 
         # Create third body with joint (no margin, should default to 0.0)
         body3_path = "/body3"
@@ -1990,8 +2170,8 @@ def PhysicsRevoluteJoint "Joint2"
         self.assertTrue(found_explicit_2, f"Expected solmix {expected_explicit_2} not found in model")
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
-    def test_geom_gap_parsing(self):
-        """Test that geom_gap attribute is parsed correctly from USD."""
+    def test_shape_gap_from_usd(self):
+        """Test that mjc:gap attribute is parsed into shape_gap from USD."""
         from pxr import Usd
 
         usd_content = """#usda 1.0
@@ -2079,39 +2259,97 @@ def PhysicsRevoluteJoint "Joint2"
         stage = Usd.Stage.CreateInMemory()
         stage.GetRootLayer().ImportFromString(usd_content)
 
+        from newton._src.usd.schemas import SchemaResolverMjc  # noqa: PLC0415
+
         builder = newton.ModelBuilder()
         SolverMuJoCo.register_custom_attributes(builder)
-        builder.add_usd(stage)
+        builder.add_usd(stage, schema_resolvers=[SchemaResolverMjc()])
         model = builder.finalize()
 
-        self.assertTrue(hasattr(model, "mujoco"), "Model should have mujoco namespace for custom attributes")
-        self.assertTrue(hasattr(model.mujoco, "geom_gap"), "Model should have geom_gap attribute")
-
-        geom_gap = model.mujoco.geom_gap.numpy()
+        shape_gap = model.shape_gap.numpy()
 
         def floats_match(arr, expected, tol=1e-4):
             return abs(arr - expected) < tol
 
         # Check that we have shapes with expected values
         expected_explicit_1 = 0.8
-        expected_default = 0.0  # default
         expected_explicit_2 = 0.7
 
         # Find shapes matching each expected value
-        found_explicit_1 = any(floats_match(geom_gap[i], expected_explicit_1) for i in range(model.shape_count))
-        found_default = any(floats_match(geom_gap[i], expected_default) for i in range(model.shape_count))
-        found_explicit_2 = any(floats_match(geom_gap[i], expected_explicit_2) for i in range(model.shape_count))
+        found_explicit_1 = any(floats_match(shape_gap[i], expected_explicit_1) for i in range(model.shape_count))
+        found_explicit_2 = any(floats_match(shape_gap[i], expected_explicit_2) for i in range(model.shape_count))
 
         self.assertTrue(found_explicit_1, f"Expected gap {expected_explicit_1} not found in model")
-        self.assertTrue(found_default, f"Expected default gap {expected_default} not found in model")
         self.assertTrue(found_explicit_2, f"Expected gap {expected_explicit_2} not found in model")
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_margin_gap_combined_conversion(self):
+        """Test MuJoCo->Newton conversion when both mjc:margin and mjc:gap are authored.
+
+        Verifies that newton_margin = mjc_margin - mjc_gap when mjc:margin is
+        explicitly authored. Also tests the case where only mjc:margin is authored
+        (gap defaults to 0, so no conversion effect).
+        """
+        from pxr import Sdf, Usd, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        # Body 1: both mjc:margin and mjc:gap authored
+        prim1 = stage.DefinePrim("/Body1", "Xform")
+        UsdPhysics.RigidBodyAPI.Apply(prim1)
+        UsdPhysics.ArticulationRootAPI.Apply(prim1)
+        col1 = stage.DefinePrim("/Body1/Collision1", "Cube")
+        UsdPhysics.CollisionAPI.Apply(col1)
+        col1.GetAttribute("size").Set(0.2)
+        col1.CreateAttribute("mjc:margin", Sdf.ValueTypeNames.Double).Set(0.5)
+        col1.CreateAttribute("mjc:gap", Sdf.ValueTypeNames.Double).Set(0.2)
+
+        # Body 2: only mjc:margin authored (gap defaults to 0)
+        prim2 = stage.DefinePrim("/Body2", "Xform")
+        UsdPhysics.RigidBodyAPI.Apply(prim2)
+        col2 = stage.DefinePrim("/Body2/Collision2", "Sphere")
+        UsdPhysics.CollisionAPI.Apply(col2)
+        col2.GetAttribute("radius").Set(0.1)
+        col2.CreateAttribute("mjc:margin", Sdf.ValueTypeNames.Double).Set(0.4)
+
+        # Joint connecting them
+        joint = UsdPhysics.RevoluteJoint.Define(stage, "/Joint1")
+        joint.GetBody0Rel().SetTargets(["/Body1"])
+        joint.GetBody1Rel().SetTargets(["/Body2"])
+        joint.GetAxisAttr().Set("Z")
+
+        from newton._src.usd.schemas import SchemaResolverMjc  # noqa: PLC0415
+
+        builder = newton.ModelBuilder()
+        SolverMuJoCo.register_custom_attributes(builder)
+        builder.add_usd(stage, schema_resolvers=[SchemaResolverMjc()])
+        model = builder.finalize()
+
+        shape_margin = model.shape_margin.numpy()
+        shape_gap = model.shape_gap.numpy()
+
+        # Body 1: mjc_margin=0.5, mjc_gap=0.2 -> newton_margin = 0.5 - 0.2 = 0.3
+        found_combined = any(
+            abs(float(shape_margin[i]) - 0.3) < 1e-4 and abs(float(shape_gap[i]) - 0.2) < 1e-4
+            for i in range(model.shape_count)
+        )
+        self.assertTrue(found_combined, "Expected margin=0.3, gap=0.2 from combined conversion")
+
+        # Body 2: mjc_margin=0.4, mjc_gap not authored -> gap defaults to 0.0
+        # from SchemaResolverMjc, so newton_margin = 0.4 - 0 = 0.4, gap = 0.0
+        found_margin_only = any(
+            abs(float(shape_margin[i]) - 0.4) < 1e-4 and abs(float(shape_gap[i])) < 1e-4
+            for i in range(model.shape_count)
+        )
+        self.assertTrue(found_margin_only, "Expected margin=0.4 with gap=0.0 when only margin authored")
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_actuator_mode_inference_from_drive(self):
-        """Test that ActuatorMode is correctly inferred from USD joint drives."""
+        """Test that JointTargetMode is correctly inferred from USD joint drives."""
         from pxr import Usd
 
-        from newton._src.sim.joints import ActuatorMode  # noqa: PLC0415
+        from newton._src.sim.enums import JointTargetMode  # noqa: PLC0415
 
         usd_content = """#usda 1.0
 (
@@ -2268,24 +2506,24 @@ def Xform "Root" (
             return sum(b.joint_dof_dim[i][0] + b.joint_dof_dim[i][1] for i in range(joint_idx))
 
         self.assertEqual(
-            builder.joint_act_mode[get_qd_start(builder, "/Root/joint_effort")],
-            int(ActuatorMode.EFFORT),
+            builder.joint_target_mode[get_qd_start(builder, "/Root/joint_effort")],
+            int(JointTargetMode.EFFORT),
         )
         self.assertEqual(
-            builder.joint_act_mode[get_qd_start(builder, "/Root/joint_passive")],
-            int(ActuatorMode.NONE),
+            builder.joint_target_mode[get_qd_start(builder, "/Root/joint_passive")],
+            int(JointTargetMode.NONE),
         )
         self.assertEqual(
-            builder.joint_act_mode[get_qd_start(builder, "/Root/joint_position")],
-            int(ActuatorMode.POSITION),
+            builder.joint_target_mode[get_qd_start(builder, "/Root/joint_position")],
+            int(JointTargetMode.POSITION),
         )
         self.assertEqual(
-            builder.joint_act_mode[get_qd_start(builder, "/Root/joint_velocity")],
-            int(ActuatorMode.VELOCITY),
+            builder.joint_target_mode[get_qd_start(builder, "/Root/joint_velocity")],
+            int(JointTargetMode.VELOCITY),
         )
         self.assertEqual(
-            builder.joint_act_mode[get_qd_start(builder, "/Root/joint_both_gains")],
-            int(ActuatorMode.POSITION),
+            builder.joint_target_mode[get_qd_start(builder, "/Root/joint_both_gains")],
+            int(JointTargetMode.POSITION),
         )
 
         stage2 = Usd.Stage.CreateInMemory()
@@ -2295,16 +2533,16 @@ def Xform "Root" (
         builder2.add_usd(stage2, force_position_velocity_actuation=True)
 
         self.assertEqual(
-            builder2.joint_act_mode[get_qd_start(builder2, "/Root/joint_both_gains")],
-            int(ActuatorMode.POSITION_VELOCITY),
+            builder2.joint_target_mode[get_qd_start(builder2, "/Root/joint_both_gains")],
+            int(JointTargetMode.POSITION_VELOCITY),
         )
         self.assertEqual(
-            builder2.joint_act_mode[get_qd_start(builder2, "/Root/joint_position")],
-            int(ActuatorMode.POSITION),
+            builder2.joint_target_mode[get_qd_start(builder2, "/Root/joint_position")],
+            int(JointTargetMode.POSITION),
         )
         self.assertEqual(
-            builder2.joint_act_mode[get_qd_start(builder2, "/Root/joint_velocity")],
-            int(ActuatorMode.VELOCITY),
+            builder2.joint_target_mode[get_qd_start(builder2, "/Root/joint_velocity")],
+            int(JointTargetMode.VELOCITY),
         )
 
     def test__add_base_joints_to_floating_bodies_default(self):
@@ -2808,16 +3046,16 @@ def verify_usdphysics_parser(test, file, model, compare_min_max_coords, floating
             f"Shape {sid} collision mismatch: USD={collision_enabled_usd}, Newton={collision_enabled_newton}",
         )
 
-        usd_quat = usd.from_gfquat(shape_spec.localRot)
+        usd_quat = usd.value_to_warp(shape_spec.localRot)
         newton_pos = newton_transform[:3]
-        newton_quat = newton_transform[3:7]
+        newton_quat = wp.quat(*newton_transform[3:7])
 
         for i, (n_pos, u_pos) in enumerate(zip(newton_pos, shape_spec.localPos, strict=False)):
             test.assertAlmostEqual(
                 n_pos, u_pos, places=5, msg=f"Shape {sid} position[{i}]: USD={u_pos}, Newton={n_pos}"
             )
 
-        if newton_type in [3, 5]:
+        if newton_type in {newton.GeoType.CAPSULE, newton.GeoType.CYLINDER, newton.GeoType.CONE}:
             usd_axis = int(shape_spec.axis) if hasattr(shape_spec, "axis") else 2
             axis_quat = (
                 quat_between_axes(newton.Axis.Z, newton.Axis.X)
@@ -4355,6 +4593,56 @@ def Xform "Articulation" (
         )
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_massapi_authored_mass_without_inertia_scales_to_uniform_density(self):
+        """Authored mass without inertia should produce inertia consistent with a uniform-density body.
+
+        Two identical 0.1 [m] cube bodies that should both end up with 8 [kg]
+        mass and inertia I_diag = (1/6) * m * s^2 [kg*m^2]:
+          A - density 8000 [kg/m^3] on the collider shape
+          B - mass 8 [kg] on the body only, inertia via scaling
+        """
+        from pxr import Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        density = 8000.0
+        size = 0.1
+        mass = density * size**3
+        expected_i = (1.0 / 6.0) * mass * size**2
+
+        def create_body(name):
+            body = UsdGeom.Xform.Define(stage, f"/World/{name}")
+            UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+            collider = UsdGeom.Cube.Define(stage, f"/World/{name}/Collider")
+            collider.CreateSizeAttr().Set(size)
+            UsdPhysics.CollisionAPI.Apply(collider.GetPrim())
+            return body.GetPrim(), collider.GetPrim()
+
+        # A: density on the collider shape derives mass and inertia.
+        body_prim, collider_prim = create_body("A")
+        UsdPhysics.MassAPI.Apply(body_prim)
+        UsdPhysics.MassAPI.Apply(collider_prim).CreateDensityAttr().Set(density)
+
+        # B: only mass authored on body, inertia scaled from shape accumulation.
+        body_prim, _ = create_body("B")
+        UsdPhysics.MassAPI.Apply(body_prim).CreateMassAttr().Set(mass)
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage)
+        idx_a = result["path_body_map"]["/World/A"]
+        idx_b = result["path_body_map"]["/World/B"]
+
+        for idx, name in ((idx_a, "A"), (idx_b, "B")):
+            self.assertAlmostEqual(builder.body_mass[idx], mass, places=5, msg=f"Body {name} mass")
+            inertia = np.array(builder.body_inertia[idx]).reshape(3, 3)
+            np.testing.assert_allclose(
+                np.diag(inertia), [expected_i] * 3, atol=1e-5, rtol=1e-5, err_msg=f"Body {name} inertia"
+            )
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_massapi_partial_body_applies_axis_rotation_in_compute_callback(self):
         """Compute fallback must rotate cone/capsule/cylinder mass frame for non-Z axes."""
         from pxr import Usd, UsdGeom, UsdPhysics
@@ -4492,7 +4780,7 @@ def Xform "Articulation" (
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_contact_margin_parsing(self):
-        """Test that contact_margin is parsed correctly from USD."""
+        """Test that newton:contactMargin is parsed into shape margin [m]."""
         from pxr import Usd, UsdGeom, UsdPhysics
 
         stage = Usd.Stage.CreateInMemory()
@@ -4500,43 +4788,132 @@ def Xform "Articulation" (
         UsdGeom.SetStageMetersPerUnit(stage, 1.0)
         UsdPhysics.Scene.Define(stage, "/physicsScene")
 
-        # Create an articulation with a body
         articulation = UsdGeom.Xform.Define(stage, "/Articulation")
         UsdPhysics.ArticulationRootAPI.Apply(articulation.GetPrim())
-
         body = UsdGeom.Xform.Define(stage, "/Articulation/Body")
-        body_prim = body.GetPrim()
-        UsdPhysics.RigidBodyAPI.Apply(body_prim)
+        UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
 
-        # Create a collider with newton:contactMargin
         collider1 = UsdGeom.Cube.Define(stage, "/Articulation/Body/Collider1")
         collider1_prim = collider1.GetPrim()
         collider1_prim.ApplyAPI("NewtonCollisionAPI")
         UsdPhysics.CollisionAPI.Apply(collider1_prim)
         collider1_prim.GetAttribute("newton:contactMargin").Set(0.05)
 
-        # Create another collider without contact_margin (should use default)
         collider2 = UsdGeom.Sphere.Define(stage, "/Articulation/Body/Collider2")
         collider2_prim = collider2.GetPrim()
         UsdPhysics.CollisionAPI.Apply(collider2_prim)
 
-        # Import the USD
         builder = newton.ModelBuilder()
-        builder.default_shape_cfg.contact_margin = 0.01  # set a known default
+        builder.default_shape_cfg.margin = 1e-5
+        builder.default_shape_cfg.gap = 0.01
+        builder.rigid_gap = 0.01
         result = builder.add_usd(stage)
         model = builder.finalize()
 
-        # Verify contact_margin was parsed correctly
         shape1_idx = result["path_shape_map"]["/Articulation/Body/Collider1"]
         shape2_idx = result["path_shape_map"]["/Articulation/Body/Collider2"]
+        self.assertAlmostEqual(model.shape_margin.numpy()[shape1_idx], 0.05, places=4)
+        self.assertAlmostEqual(model.shape_margin.numpy()[shape2_idx], 1e-5, places=6)
 
-        # Collider1 should have the authored value
-        margin1 = model.shape_contact_margin.numpy()[shape1_idx]
-        self.assertAlmostEqual(margin1, 0.05, places=4)
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_contact_gap_parsing(self):
+        """Test that newton:contactGap is parsed into shape gap [m]."""
+        from pxr import Usd, UsdGeom, UsdPhysics
 
-        # Collider2 should have the default value
-        margin2 = model.shape_contact_margin.numpy()[shape2_idx]
-        self.assertAlmostEqual(margin2, 0.01, places=4)
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        articulation = UsdGeom.Xform.Define(stage, "/Articulation")
+        UsdPhysics.ArticulationRootAPI.Apply(articulation.GetPrim())
+        body = UsdGeom.Xform.Define(stage, "/Articulation/Body")
+        UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+
+        collider1 = UsdGeom.Cube.Define(stage, "/Articulation/Body/Collider1")
+        collider1_prim = collider1.GetPrim()
+        collider1_prim.ApplyAPI("NewtonCollisionAPI")
+        UsdPhysics.CollisionAPI.Apply(collider1_prim)
+        collider1_prim.GetAttribute("newton:contactGap").Set(0.02)
+
+        collider2 = UsdGeom.Sphere.Define(stage, "/Articulation/Body/Collider2")
+        collider2_prim = collider2.GetPrim()
+        UsdPhysics.CollisionAPI.Apply(collider2_prim)
+
+        builder = newton.ModelBuilder()
+        builder.default_shape_cfg.margin = 0.0
+        builder.default_shape_cfg.gap = 0.01
+        builder.rigid_gap = 0.01
+        result = builder.add_usd(stage)
+        model = builder.finalize()
+
+        shape1_idx = result["path_shape_map"]["/Articulation/Body/Collider1"]
+        shape2_idx = result["path_shape_map"]["/Articulation/Body/Collider2"]
+        self.assertAlmostEqual(model.shape_gap.numpy()[shape1_idx], 0.02, places=4)
+        self.assertAlmostEqual(model.shape_gap.numpy()[shape2_idx], 0.01, places=4)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_mimic_constraint_parsing(self):
+        """Test that NewtonMimicAPI on a joint is parsed into a mimic constraint."""
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        articulation = UsdGeom.Xform.Define(stage, "/World/Articulation")
+        UsdPhysics.ArticulationRootAPI.Apply(articulation.GetPrim())
+
+        root = UsdGeom.Xform.Define(stage, "/World/Articulation/Root")
+        UsdPhysics.RigidBodyAPI.Apply(root.GetPrim())
+        link1 = UsdGeom.Xform.Define(stage, "/World/Articulation/Link1")
+        UsdPhysics.RigidBodyAPI.Apply(link1.GetPrim())
+        link2 = UsdGeom.Xform.Define(stage, "/World/Articulation/Link2")
+        UsdPhysics.RigidBodyAPI.Apply(link2.GetPrim())
+
+        fixed = UsdPhysics.FixedJoint.Define(stage, "/World/Articulation/RootToWorld")
+        fixed.CreateBody0Rel().SetTargets([root.GetPath()])
+        fixed.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        fixed.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        fixed.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        fixed.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+
+        joint1 = UsdPhysics.RevoluteJoint.Define(stage, "/World/Articulation/Joint1")
+        joint1.CreateBody0Rel().SetTargets([root.GetPath()])
+        joint1.CreateBody1Rel().SetTargets([link1.GetPath()])
+        joint1.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        joint1.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        joint1.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        joint1.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        joint1.CreateAxisAttr().Set("Z")
+
+        joint2 = UsdPhysics.RevoluteJoint.Define(stage, "/World/Articulation/Joint2")
+        joint2.CreateBody0Rel().SetTargets([link1.GetPath()])
+        joint2.CreateBody1Rel().SetTargets([link2.GetPath()])
+        joint2.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        joint2.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        joint2.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        joint2.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        joint2.CreateAxisAttr().Set("Z")
+        joint2_prim = joint2.GetPrim()
+        joint2_prim.ApplyAPI("NewtonMimicAPI")
+        joint2_prim.GetRelationship("newton:mimicJoint").SetTargets([joint1.GetPrim().GetPath()])
+        joint2_prim.GetAttribute("newton:mimicCoef0").Set(0.5)
+        joint2_prim.GetAttribute("newton:mimicCoef1").Set(2.0)
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage)
+        model = builder.finalize()
+
+        self.assertEqual(model.constraint_mimic_count, 1)
+        path_joint_map = result["path_joint_map"]
+        joint1_idx = path_joint_map["/World/Articulation/Joint1"]
+        joint2_idx = path_joint_map["/World/Articulation/Joint2"]
+        self.assertEqual(model.constraint_mimic_joint0.numpy()[0], joint2_idx)
+        self.assertEqual(model.constraint_mimic_joint1.numpy()[0], joint1_idx)
+        self.assertAlmostEqual(model.constraint_mimic_coef0.numpy()[0], 0.5, places=5)
+        self.assertAlmostEqual(model.constraint_mimic_coef1.numpy()[0], 2.0, places=5)
 
     @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
     def test_scene_gravity_enabled_parsing(self):
@@ -6027,14 +6404,19 @@ def Xform "BodyWithoutVisuals" (
         self.assertTrue(flags_forced & ShapeFlags.COLLIDE_SHAPES)
         self.assertTrue(flags_forced & ShapeFlags.VISIBLE)
 
-        # hide_collision_shapes=True: no VISIBLE flag on any collision shape
+        # hide_collision_shapes=True: hide colliders on bodies that have visuals
+        # but keep colliders visible on bodies with no visual-only geometry.
         builder3 = newton.ModelBuilder()
         result3 = builder3.add_usd(stage, hide_collision_shapes=True)
         path_shape_map3 = result3["path_shape_map"]
 
-        for path in ["/BodyWithVisuals/CollisionBox", "/BodyWithoutVisuals/CollisionSphere"]:
-            flags_hidden = builder3.shape_flags[path_shape_map3[path]]
-            self.assertFalse(flags_hidden & ShapeFlags.VISIBLE)
+        flags_hidden_with_visual = builder3.shape_flags[path_shape_map3["/BodyWithVisuals/CollisionBox"]]
+        self.assertTrue(flags_hidden_with_visual & ShapeFlags.COLLIDE_SHAPES)
+        self.assertFalse(flags_hidden_with_visual & ShapeFlags.VISIBLE)
+
+        flags_fallback_no_visual = builder3.shape_flags[path_shape_map3["/BodyWithoutVisuals/CollisionSphere"]]
+        self.assertTrue(flags_fallback_no_visual & ShapeFlags.COLLIDE_SHAPES)
+        self.assertTrue(flags_fallback_no_visual & ShapeFlags.VISIBLE)
 
         # load_visual_shapes=False: collision shapes auto-get VISIBLE (no visuals loaded)
         builder4 = newton.ModelBuilder()
@@ -6045,6 +6427,1835 @@ def Xform "BodyWithoutVisuals" (
         flags_no_load = builder4.shape_flags[collision_no_load]
         self.assertTrue(flags_no_load & ShapeFlags.COLLIDE_SHAPES)
         self.assertTrue(flags_no_load & ShapeFlags.VISIBLE)
+
+    @staticmethod
+    def _create_stage_with_pbr_collision_mesh(color, roughness, metallic, *, add_visual_sphere=False):
+        """Create a stage with a rigid body containing a collision mesh with PBR material."""
+        from pxr import Sdf, Usd, UsdGeom, UsdPhysics, UsdShade
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        body = UsdGeom.Xform.Define(stage, "/Body")
+        UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+
+        if add_visual_sphere:
+            visual_sphere = UsdGeom.Sphere.Define(stage, "/Body/VisualSphere")
+            visual_sphere.CreateRadiusAttr().Set(0.1)
+
+        collision_mesh = UsdGeom.Mesh.Define(stage, "/Body/CollisionMesh")
+        collision_mesh_prim = collision_mesh.GetPrim()
+        UsdPhysics.CollisionAPI.Apply(collision_mesh_prim)
+        collision_mesh.CreatePointsAttr().Set(
+            [
+                (-0.5, 0.0, 0.0),
+                (0.5, 0.0, 0.0),
+                (0.0, 0.5, 0.0),
+                (0.0, 0.0, 0.5),
+            ]
+        )
+        collision_mesh.CreateFaceVertexCountsAttr().Set([3, 3, 3, 3])
+        collision_mesh.CreateFaceVertexIndicesAttr().Set([0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3])
+
+        material = UsdShade.Material.Define(stage, "/Materials/PBR")
+        shader = UsdShade.Shader.Define(stage, "/Materials/PBR/PreviewSurface")
+        shader.CreateIdAttr("UsdPreviewSurface")
+        shader.CreateInput("baseColor", Sdf.ValueTypeNames.Color3f).Set(color)
+        shader.CreateInput("roughness", Sdf.ValueTypeNames.Float).Set(roughness)
+        shader.CreateInput("metallic", Sdf.ValueTypeNames.Float).Set(metallic)
+        material.CreateSurfaceOutput().ConnectToSource(shader.ConnectableAPI(), "surface")
+        UsdShade.MaterialBindingAPI.Apply(collision_mesh_prim).Bind(material)
+
+        return stage
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_visible_collision_mesh_inherits_visual_material_properties(self):
+        """Visible fallback collider meshes should carry resolved visual material data."""
+        stage = self._create_stage_with_pbr_collision_mesh(color=(0.2, 0.4, 0.6), roughness=0.35, metallic=0.75)
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, hide_collision_shapes=True)
+        collision_shape = result["path_shape_map"]["/Body/CollisionMesh"]
+
+        flags = builder.shape_flags[collision_shape]
+        self.assertTrue(flags & ShapeFlags.COLLIDE_SHAPES)
+        self.assertTrue(flags & ShapeFlags.VISIBLE)
+
+        mesh = builder.shape_source[collision_shape]
+        self.assertIsNotNone(mesh)
+        np.testing.assert_allclose(np.array(mesh.color), np.array([0.2, 0.4, 0.6]), atol=1e-6, rtol=1e-6)
+        self.assertAlmostEqual(mesh.roughness, 0.35, places=6)
+        self.assertAlmostEqual(mesh.metallic, 0.75, places=6)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_visible_collision_mesh_texture_does_not_change_body_mass(self):
+        """Render-only UV loading must not perturb collider mass or inertia."""
+        stage = self._create_stage_with_pbr_collision_mesh(color=(0.2, 0.4, 0.6), roughness=0.35, metallic=0.75)
+
+        base_vertices = np.array(
+            [
+                (-0.5, 0.0, 0.0),
+                (0.5, 0.0, 0.0),
+                (0.0, 0.5, 0.0),
+                (0.0, 0.0, 0.5),
+            ],
+            dtype=np.float32,
+        )
+        indices = np.array([0, 2, 1, 0, 1, 3, 0, 3, 2, 1, 2, 3], dtype=np.int32)
+        physics_mesh = newton.Mesh(base_vertices, indices)
+        render_mesh = newton.Mesh(base_vertices * 4.0, indices)
+        render_mesh._uvs = np.zeros((render_mesh.vertices.shape[0], 2), dtype=np.float32)
+
+        def _mock_get_mesh(_prim, *, load_uvs=False, load_normals=False):
+            del load_normals
+            return render_mesh if load_uvs else physics_mesh
+
+        with (
+            mock.patch(
+                "newton._src.utils.import_usd.usd.resolve_material_properties_for_prim",
+                return_value={
+                    "color": None,
+                    "roughness": 0.35,
+                    "metallic": 0.75,
+                    "texture": "dummy.png",
+                },
+            ),
+            mock.patch(
+                "newton._src.utils.import_usd.usd.get_mesh",
+                side_effect=_mock_get_mesh,
+            ),
+        ):
+            builder = newton.ModelBuilder()
+            result = builder.add_usd(stage, hide_collision_shapes=True)
+
+        body_idx = result["path_body_map"]["/Body"]
+        collision_shape = result["path_shape_map"]["/Body/CollisionMesh"]
+        expected_density = builder.default_shape_cfg.density
+
+        self.assertAlmostEqual(builder.body_mass[body_idx], physics_mesh.mass * expected_density, places=6)
+        self.assertNotAlmostEqual(builder.body_mass[body_idx], render_mesh.mass * expected_density, places=3)
+
+        mesh = builder.shape_source[collision_shape]
+        self.assertIsNotNone(mesh)
+        self.assertEqual(mesh.texture, "dummy.png")
+        self.assertIsNotNone(mesh.uvs)
+        np.testing.assert_allclose(mesh.vertices, render_mesh.vertices, atol=1e-6, rtol=1e-6)
+        self.assertAlmostEqual(mesh.mass, physics_mesh.mass, places=6)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_visualized_collision_mesh_remains_visible_when_body_has_visual_shapes(self):
+        """Mesh colliders with visual material data stay visible even when body visuals exist."""
+        stage = self._create_stage_with_pbr_collision_mesh(
+            color=(0.9, 0.1, 0.2), roughness=0.55, metallic=0.25, add_visual_sphere=True
+        )
+
+        builder = newton.ModelBuilder()
+        result = builder.add_usd(stage, hide_collision_shapes=True)
+        path_shape_map = result["path_shape_map"]
+
+        self.assertIn("/Body/VisualSphere", path_shape_map)
+        visual_shape = path_shape_map["/Body/VisualSphere"]
+        self.assertFalse(builder.shape_flags[visual_shape] & ShapeFlags.COLLIDE_SHAPES)
+
+        collision_shape = path_shape_map["/Body/CollisionMesh"]
+        flags = builder.shape_flags[collision_shape]
+        self.assertTrue(flags & ShapeFlags.COLLIDE_SHAPES)
+        self.assertTrue(flags & ShapeFlags.VISIBLE)
+
+        mesh = builder.shape_source[collision_shape]
+        self.assertIsNotNone(mesh)
+        np.testing.assert_allclose(np.array(mesh.color), np.array([0.9, 0.1, 0.2]), atol=1e-6, rtol=1e-6)
+        self.assertAlmostEqual(mesh.roughness, 0.55, places=6)
+        self.assertAlmostEqual(mesh.metallic, 0.25, places=6)
+
+
+class TestImportUsdMimicJoint(unittest.TestCase):
+    """Tests for PhysxMimicJointAPI parsing during USD import."""
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_physx_mimic_joint_basic(self):
+        """PhysxMimicJointAPI on a revolute joint creates a mimic constraint."""
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.SetStageKilogramsPerUnit(stage, 1.0)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+
+        root = stage.DefinePrim("/Root", "Xform")
+        stage.SetDefaultPrim(root)
+
+        art = stage.DefinePrim("/Root/Robot", "Xform")
+        UsdPhysics.ArticulationRootAPI.Apply(art)
+
+        # base body
+        base = stage.DefinePrim("/Root/Robot/base", "Cube")
+        UsdPhysics.RigidBodyAPI.Apply(base)
+        UsdPhysics.MassAPI.Apply(base).CreateMassAttr(1.0)
+
+        # link1
+        link1 = stage.DefinePrim("/Root/Robot/link1", "Cube")
+        UsdPhysics.RigidBodyAPI.Apply(link1)
+        UsdPhysics.MassAPI.Apply(link1).CreateMassAttr(1.0)
+
+        # link2
+        link2 = stage.DefinePrim("/Root/Robot/link2", "Cube")
+        UsdPhysics.RigidBodyAPI.Apply(link2)
+        UsdPhysics.MassAPI.Apply(link2).CreateMassAttr(1.0)
+
+        # leader joint: base -> link1
+        leader = UsdPhysics.RevoluteJoint.Define(stage, "/Root/Robot/Joints/leader")
+        leader.CreateAxisAttr("Z")
+        leader.CreateBody0Rel().SetTargets(["/Root/Robot/base"])
+        leader.CreateBody1Rel().SetTargets(["/Root/Robot/link1"])
+        leader.CreateLocalPos0Attr().Set(Gf.Vec3f(0, 0, 0.5))
+        leader.CreateLocalPos1Attr().Set(Gf.Vec3f(0, 0, -0.5))
+        leader.CreateLocalRot0Attr().Set(Gf.Quatf(1, 0, 0, 0))
+        leader.CreateLocalRot1Attr().Set(Gf.Quatf(1, 0, 0, 0))
+
+        # follower joint: base -> link2
+        follower = UsdPhysics.RevoluteJoint.Define(stage, "/Root/Robot/Joints/follower")
+        follower.CreateAxisAttr("Z")
+        follower.CreateBody0Rel().SetTargets(["/Root/Robot/base"])
+        follower.CreateBody1Rel().SetTargets(["/Root/Robot/link2"])
+        follower.CreateLocalPos0Attr().Set(Gf.Vec3f(0.5, 0, 0.5))
+        follower.CreateLocalPos1Attr().Set(Gf.Vec3f(0, 0, -0.5))
+        follower.CreateLocalRot0Attr().Set(Gf.Quatf(1, 0, 0, 0))
+        follower.CreateLocalRot1Attr().Set(Gf.Quatf(1, 0, 0, 0))
+
+        # Apply PhysxMimicJointAPI:rotZ to follower via metadata
+        # (PhysxMimicJointAPI is not in usd-core, so use raw metadata)
+        follower_prim = follower.GetPrim()
+        from pxr import Sdf
+
+        follower_prim.SetMetadata("apiSchemas", Sdf.TokenListOp.Create(prependedItems=["PhysxMimicJointAPI:rotZ"]))
+        follower_prim.CreateRelationship("physxMimicJoint:rotZ:referenceJoint").SetTargets(
+            ["/Root/Robot/Joints/leader"]
+        )
+        follower_prim.CreateAttribute("physxMimicJoint:rotZ:gearing", Sdf.ValueTypeNames.Float).Set(-2.0)
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(stage)
+
+        self.assertEqual(len(builder.constraint_mimic_joint0), 1)
+
+        model = builder.finalize()
+        self.assertEqual(model.constraint_mimic_count, 1)
+
+        joint0 = model.constraint_mimic_joint0.numpy()[0]
+        joint1 = model.constraint_mimic_joint1.numpy()[0]
+        coef0 = model.constraint_mimic_coef0.numpy()[0]
+        coef1 = model.constraint_mimic_coef1.numpy()[0]
+
+        follower_idx = model.joint_label.index("/Root/Robot/Joints/follower")
+        leader_idx = model.joint_label.index("/Root/Robot/Joints/leader")
+
+        self.assertEqual(joint0, follower_idx)
+        self.assertEqual(joint1, leader_idx)
+        # PhysX: jointPos + gearing * refPos + offset = 0
+        # Newton: joint0 = coef0 + coef1 * joint1
+        # So coef1 = -gearing = -(-2.0) = 2.0, coef0 = -offset = 0.0
+        self.assertAlmostEqual(coef0, 0.0, places=5)
+        self.assertAlmostEqual(coef1, 2.0, places=5)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_physx_mimic_joint_no_api_no_constraint(self):
+        """Joints without PhysxMimicJointAPI produce no mimic constraints."""
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.SetStageKilogramsPerUnit(stage, 1.0)
+        UsdGeom.SetStageMetersPerUnit(stage, 1.0)
+
+        root = stage.DefinePrim("/Root", "Xform")
+        stage.SetDefaultPrim(root)
+
+        art = stage.DefinePrim("/Root/Robot", "Xform")
+        UsdPhysics.ArticulationRootAPI.Apply(art)
+
+        base = stage.DefinePrim("/Root/Robot/base", "Cube")
+        UsdPhysics.RigidBodyAPI.Apply(base)
+        UsdPhysics.MassAPI.Apply(base).CreateMassAttr(1.0)
+
+        link1 = stage.DefinePrim("/Root/Robot/link1", "Cube")
+        UsdPhysics.RigidBodyAPI.Apply(link1)
+        UsdPhysics.MassAPI.Apply(link1).CreateMassAttr(1.0)
+
+        joint = UsdPhysics.RevoluteJoint.Define(stage, "/Root/Robot/Joints/joint1")
+        joint.CreateAxisAttr("Z")
+        joint.CreateBody0Rel().SetTargets(["/Root/Robot/base"])
+        joint.CreateBody1Rel().SetTargets(["/Root/Robot/link1"])
+        joint.CreateLocalPos0Attr().Set(Gf.Vec3f(0, 0, 0.5))
+        joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0, 0, -0.5))
+        joint.CreateLocalRot0Attr().Set(Gf.Quatf(1, 0, 0, 0))
+        joint.CreateLocalRot1Attr().Set(Gf.Quatf(1, 0, 0, 0))
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(stage)
+
+        self.assertEqual(len(builder.constraint_mimic_joint0), 0)
+
+
+class TestHasAppliedApiSchema(unittest.TestCase):
+    """Test the has_applied_api_schema helper in newton.usd.utils."""
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_unregistered_schema_via_metadata(self):
+        from pxr import Usd
+
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().ImportFromString(
+            """#usda 1.0
+def Sphere "WithSiteAPI" (
+    prepend apiSchemas = ["MjcSiteAPI"]
+)
+{
+    double radius = 0.1
+}
+
+def Sphere "WithoutSiteAPI"
+{
+    double radius = 0.1
+}
+"""
+        )
+
+        prim_with = stage.GetPrimAtPath("/WithSiteAPI")
+        prim_without = stage.GetPrimAtPath("/WithoutSiteAPI")
+
+        self.assertTrue(usd.has_applied_api_schema(prim_with, "MjcSiteAPI"))
+        self.assertFalse(usd.has_applied_api_schema(prim_without, "MjcSiteAPI"))
+        self.assertFalse(usd.has_applied_api_schema(prim_with, "NonExistentAPI"))
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_registered_schema_via_has_api(self):
+        from pxr import Usd, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        prim = stage.DefinePrim("/Body", "Xform")
+        UsdPhysics.RigidBodyAPI.Apply(prim)
+
+        self.assertTrue(usd.has_applied_api_schema(prim, "PhysicsRigidBodyAPI"))
+        self.assertFalse(usd.has_applied_api_schema(prim, "PhysicsMassAPI"))
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_appended_and_explicit_items(self):
+        from pxr import Usd
+
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().ImportFromString(
+            """#usda 1.0
+def Sphere "AppendedSchema" (
+    append apiSchemas = ["MjcSiteAPI"]
+)
+{
+    double radius = 0.1
+}
+"""
+        )
+
+        prim = stage.GetPrimAtPath("/AppendedSchema")
+        self.assertTrue(usd.has_applied_api_schema(prim, "MjcSiteAPI"))
+
+
+class TestOverrideRootXform(unittest.TestCase):
+    """Tests for override_root_xform parameter in the USD importer."""
+
+    @staticmethod
+    def _make_stage_with_root_offset():
+        """Create a USD stage with an articulation under a translated ancestor."""
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        env = UsdGeom.Xform.Define(stage, "/World/env")
+        env.AddTranslateOp().Set(Gf.Vec3d(100.0, 200.0, 0.0))
+
+        root = UsdGeom.Xform.Define(stage, "/World/env/Robot")
+        UsdPhysics.ArticulationRootAPI.Apply(root.GetPrim())
+
+        base = UsdGeom.Xform.Define(stage, "/World/env/Robot/Base")
+        UsdPhysics.RigidBodyAPI.Apply(base.GetPrim())
+        UsdPhysics.MassAPI.Apply(base.GetPrim()).GetMassAttr().Set(1.0)
+
+        link = UsdGeom.Xform.Define(stage, "/World/env/Robot/Link")
+        link.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 1.0))
+        UsdPhysics.RigidBodyAPI.Apply(link.GetPrim())
+        UsdPhysics.MassAPI.Apply(link.GetPrim()).GetMassAttr().Set(0.5)
+
+        joint = UsdPhysics.RevoluteJoint.Define(stage, "/World/env/Robot/Joint")
+        joint.CreateBody0Rel().SetTargets(["/World/env/Robot/Base"])
+        joint.CreateBody1Rel().SetTargets(["/World/env/Robot/Link"])
+        joint.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 1.0))
+        joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        joint.CreateAxisAttr().Set("Z")
+
+        return stage
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_default_xform_is_relative(self):
+        """With override_root_xform=False (default), xform composes with ancestor transforms."""
+        stage = self._make_stage_with_root_offset()
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(stage, xform=wp.transform((5.0, 0.0, 0.0), wp.quat_identity()), floating=False)
+
+        model = builder.finalize()
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+
+        body_q = state.body_q.numpy()
+        base_idx = builder.body_label.index("/World/env/Robot/Base")
+        # xform (5,0,0) composed with ancestor (100,200,0) => (105, 200, 0)
+        np.testing.assert_allclose(body_q[base_idx, :3], [105.0, 200.0, 0.0], atol=1e-4)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_override_places_at_xform(self):
+        """With override_root_xform=True, root body is placed at exactly xform."""
+        stage = self._make_stage_with_root_offset()
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(
+            stage,
+            xform=wp.transform((5.0, 0.0, 0.0), wp.quat_identity()),
+            floating=False,
+            override_root_xform=True,
+        )
+
+        model = builder.finalize()
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+
+        body_q = state.body_q.numpy()
+        base_idx = builder.body_label.index("/World/env/Robot/Base")
+        np.testing.assert_allclose(body_q[base_idx, :3], [5.0, 0.0, 0.0], atol=1e-4)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_override_preserves_child_offset(self):
+        """With override_root_xform=True, child body keeps its relative offset from root."""
+        stage = self._make_stage_with_root_offset()
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(
+            stage,
+            xform=wp.transform((5.0, 0.0, 0.0), wp.quat_identity()),
+            floating=False,
+            override_root_xform=True,
+        )
+
+        model = builder.finalize()
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+
+        body_q = state.body_q.numpy()
+        link_idx = builder.body_label.index("/World/env/Robot/Link")
+        np.testing.assert_allclose(body_q[link_idx, :3], [5.0, 0.0, 1.0], atol=1e-4)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_override_with_rotation(self):
+        """override_root_xform=True with a non-identity rotation correctly rotates the articulation."""
+        stage = self._make_stage_with_root_offset()
+        angle = np.pi / 2
+        quat = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), angle)
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(
+            stage,
+            xform=wp.transform((5.0, 0.0, 0.0), quat),
+            floating=False,
+            override_root_xform=True,
+        )
+
+        model = builder.finalize()
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+
+        body_q = state.body_q.numpy()
+        base_idx = builder.body_label.index("/World/env/Robot/Base")
+        link_idx = builder.body_label.index("/World/env/Robot/Link")
+
+        np.testing.assert_allclose(body_q[base_idx, :3], [5.0, 0.0, 0.0], atol=1e-4)
+        np.testing.assert_allclose(body_q[base_idx, 3:], [*quat], atol=1e-4)
+        # Link is at (0,0,1) relative to root; Z-rotation doesn't affect Z offset
+        np.testing.assert_allclose(body_q[link_idx, :3], [5.0, 0.0, 1.0], atol=1e-4)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_override_cloning(self):
+        """Cloning the same articulation at multiple positions with override_root_xform=True."""
+        stage = self._make_stage_with_root_offset()
+
+        builder = newton.ModelBuilder()
+        clone_positions = [(0.0, 0.0, 0.0), (2.0, 0.0, 0.0), (4.0, 0.0, 0.0)]
+        for pos in clone_positions:
+            builder.add_usd(
+                stage, xform=wp.transform(pos, wp.quat_identity()), floating=False, override_root_xform=True
+            )
+
+        model = builder.finalize()
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+
+        body_q = state.body_q.numpy()
+        base_indices = [j for j, lbl in enumerate(builder.body_label) if lbl.endswith("/Robot/Base")]
+        for i, expected_pos in enumerate(clone_positions):
+            np.testing.assert_allclose(
+                body_q[base_indices[i], :3],
+                list(expected_pos),
+                atol=1e-4,
+                err_msg=f"Clone {i} not at expected position",
+            )
+
+    @staticmethod
+    def _make_two_articulation_stage():
+        """Create a USD stage with two articulations at different positions."""
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        for name, offset in [("RobotA", (10.0, 0.0, 0.0)), ("RobotB", (0.0, 20.0, 0.0))]:
+            root_path = f"/World/{name}"
+            root = UsdGeom.Xform.Define(stage, root_path)
+            root.AddTranslateOp().Set(Gf.Vec3d(*offset))
+            UsdPhysics.ArticulationRootAPI.Apply(root.GetPrim())
+
+            base = UsdGeom.Xform.Define(stage, f"{root_path}/Base")
+            UsdPhysics.RigidBodyAPI.Apply(base.GetPrim())
+            UsdPhysics.MassAPI.Apply(base.GetPrim()).GetMassAttr().Set(1.0)
+
+            link = UsdGeom.Xform.Define(stage, f"{root_path}/Link")
+            link.AddTranslateOp().Set(Gf.Vec3d(offset[0], offset[1], offset[2] + 1.0))
+            UsdPhysics.RigidBodyAPI.Apply(link.GetPrim())
+            UsdPhysics.MassAPI.Apply(link.GetPrim()).GetMassAttr().Set(0.5)
+
+            joint = UsdPhysics.RevoluteJoint.Define(stage, f"{root_path}/Joint")
+            joint.CreateBody0Rel().SetTargets([f"{root_path}/Base"])
+            joint.CreateBody1Rel().SetTargets([f"{root_path}/Link"])
+            joint.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 1.0))
+            joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+            joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+            joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+            joint.CreateAxisAttr().Set("Z")
+
+        return stage
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_multiple_articulations_default_keeps_relative(self):
+        """Without override, multiple articulations keep their relative positions shifted by xform."""
+        stage = self._make_two_articulation_stage()
+
+        shift = (1.0, 2.0, 3.0)
+        builder = newton.ModelBuilder()
+        builder.add_usd(stage, xform=wp.transform(shift, wp.quat_identity()), floating=False)
+
+        model = builder.finalize()
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+
+        body_q = state.body_q.numpy()
+        offsets = {"RobotA": (10.0, 0.0, 0.0), "RobotB": (0.0, 20.0, 0.0)}
+        for name, offset in offsets.items():
+            idx = next(j for j, lbl in enumerate(builder.body_label) if f"{name}/Base" in lbl)
+            expected = [shift[k] + offset[k] for k in range(3)]
+            np.testing.assert_allclose(
+                body_q[idx, :3],
+                expected,
+                atol=1e-4,
+                err_msg=f"{name} should be at xform + original offset",
+            )
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_override_without_xform_raises(self):
+        """override_root_xform=True without providing xform should raise a ValueError."""
+        stage = self._make_stage_with_root_offset()
+        builder = newton.ModelBuilder()
+        with self.assertRaises(ValueError):
+            builder.add_usd(stage, floating=False, override_root_xform=True)
+
+    @staticmethod
+    def _make_stage_with_visual():
+        """Create a USD stage with a visual-only cube under a rigid body beneath a translated ancestor."""
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        env = UsdGeom.Xform.Define(stage, "/World/env")
+        env.AddTranslateOp().Set(Gf.Vec3d(100.0, 200.0, 0.0))
+
+        root = UsdGeom.Xform.Define(stage, "/World/env/Robot")
+        UsdPhysics.ArticulationRootAPI.Apply(root.GetPrim())
+
+        base = UsdGeom.Xform.Define(stage, "/World/env/Robot/Base")
+        UsdPhysics.RigidBodyAPI.Apply(base.GetPrim())
+        UsdPhysics.MassAPI.Apply(base.GetPrim()).GetMassAttr().Set(1.0)
+
+        UsdGeom.Cube.Define(stage, "/World/env/Robot/Base/Visual").GetSizeAttr().Set(0.1)
+
+        link = UsdGeom.Xform.Define(stage, "/World/env/Robot/Link")
+        link.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 1.0))
+        UsdPhysics.RigidBodyAPI.Apply(link.GetPrim())
+        UsdPhysics.MassAPI.Apply(link.GetPrim()).GetMassAttr().Set(0.5)
+
+        joint = UsdPhysics.RevoluteJoint.Define(stage, "/World/env/Robot/Joint")
+        joint.CreateBody0Rel().SetTargets(["/World/env/Robot/Base"])
+        joint.CreateBody1Rel().SetTargets(["/World/env/Robot/Link"])
+        joint.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 1.0))
+        joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        joint.CreateAxisAttr().Set("Z")
+
+        return stage
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_visual_shape_aligned_with_body(self):
+        """Visual shapes stay aligned with their rigid body with default override_root_xform=False."""
+        stage = self._make_stage_with_visual()
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(
+            stage,
+            xform=wp.transform((5.0, 0.0, 0.0), wp.quat_identity()),
+            floating=False,
+        )
+
+        base_idx = builder.body_label.index("/World/env/Robot/Base")
+        visual_shapes = [i for i, b in enumerate(builder.shape_body) if b == base_idx]
+        self.assertGreater(len(visual_shapes), 0, "Expected at least one visual shape on Base")
+
+        for sid in visual_shapes:
+            shape_tf = builder.shape_transform[sid]
+            np.testing.assert_allclose(
+                shape_tf.p, [0.0, 0.0, 0.0], atol=1e-4, err_msg="Visual shape position should be at body origin"
+            )
+            np.testing.assert_allclose(
+                shape_tf.q, [0.0, 0.0, 0.0, 1.0], atol=1e-4, err_msg="Visual shape rotation should be identity"
+            )
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_override_visual_shape_aligned_with_body(self):
+        """Visual shapes stay aligned with their rigid body when override_root_xform=True
+        strips a non-identity ancestor transform."""
+        stage = self._make_stage_with_visual()
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(
+            stage,
+            xform=wp.transform((5.0, 0.0, 0.0), wp.quat_identity()),
+            floating=False,
+            override_root_xform=True,
+        )
+
+        base_idx = builder.body_label.index("/World/env/Robot/Base")
+        visual_shapes = [i for i, b in enumerate(builder.shape_body) if b == base_idx]
+        self.assertGreater(len(visual_shapes), 0, "Expected at least one visual shape on Base")
+
+        for sid in visual_shapes:
+            shape_tf = builder.shape_transform[sid]
+            np.testing.assert_allclose(
+                shape_tf.p, [0.0, 0.0, 0.0], atol=1e-4, err_msg="Visual shape position should be at body origin"
+            )
+            np.testing.assert_allclose(
+                shape_tf.q, [0.0, 0.0, 0.0, 1.0], atol=1e-4, err_msg="Visual shape rotation should be identity"
+            )
+
+    @staticmethod
+    def _make_stage_with_loop_joint():
+        """Create a USD stage with a 3-body chain and an excludeFromArticulation loop joint."""
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        env = UsdGeom.Xform.Define(stage, "/World/env")
+        env.AddTranslateOp().Set(Gf.Vec3d(100.0, 200.0, 0.0))
+
+        root = UsdGeom.Xform.Define(stage, "/World/env/Robot")
+        UsdPhysics.ArticulationRootAPI.Apply(root.GetPrim())
+
+        for name, pos in [("Base", (0, 0, 0)), ("Mid", (0, 0, 1)), ("Tip", (0, 0, 2))]:
+            body = UsdGeom.Xform.Define(stage, f"/World/env/Robot/{name}")
+            body.AddTranslateOp().Set(Gf.Vec3d(*pos))
+            UsdPhysics.RigidBodyAPI.Apply(body.GetPrim())
+            UsdPhysics.MassAPI.Apply(body.GetPrim()).GetMassAttr().Set(1.0)
+
+        for jname, b0, b1 in [("J1", "Base", "Mid"), ("J2", "Mid", "Tip")]:
+            j = UsdPhysics.RevoluteJoint.Define(stage, f"/World/env/Robot/{jname}")
+            j.CreateBody0Rel().SetTargets([f"/World/env/Robot/{b0}"])
+            j.CreateBody1Rel().SetTargets([f"/World/env/Robot/{b1}"])
+            j.CreateLocalPos0Attr().Set(Gf.Vec3f(0, 0, 1))
+            j.CreateLocalPos1Attr().Set(Gf.Vec3f(0, 0, 0))
+            j.CreateLocalRot0Attr().Set(Gf.Quatf(1, 0, 0, 0))
+            j.CreateLocalRot1Attr().Set(Gf.Quatf(1, 0, 0, 0))
+            j.CreateAxisAttr().Set("Z")
+
+        loop = UsdPhysics.FixedJoint.Define(stage, "/World/env/Robot/LoopJoint")
+        loop.CreateBody0Rel().SetTargets(["/World/env/Robot/Base"])
+        loop.CreateBody1Rel().SetTargets(["/World/env/Robot/Tip"])
+        loop.CreateLocalPos0Attr().Set(Gf.Vec3f(0, 0, 2))
+        loop.CreateLocalPos1Attr().Set(Gf.Vec3f(0, 0, 0))
+        loop.CreateLocalRot0Attr().Set(Gf.Quatf(1, 0, 0, 0))
+        loop.CreateLocalRot1Attr().Set(Gf.Quatf(1, 0, 0, 0))
+        from pxr import Sdf
+
+        loop.GetPrim().CreateAttribute("physics:excludeFromArticulation", Sdf.ValueTypeNames.Bool).Set(True)
+
+        return stage
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_loop_joint_default(self):
+        """Loop joint body positions are correct with default xform (relative)."""
+        stage = self._make_stage_with_loop_joint()
+        shift = (5.0, 0.0, 0.0)
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(stage, xform=wp.transform(shift, wp.quat_identity()), floating=False)
+
+        model = builder.finalize()
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+
+        body_q = state.body_q.numpy()
+        # Default: xform composes with ancestor (100,200,0)
+        base_idx = builder.body_label.index("/World/env/Robot/Base")
+        tip_idx = builder.body_label.index("/World/env/Robot/Tip")
+        np.testing.assert_allclose(body_q[base_idx, :3], [105.0, 200.0, 0.0], atol=1e-4)
+        np.testing.assert_allclose(body_q[tip_idx, :3], [105.0, 200.0, 2.0], atol=1e-4)
+
+        # Loop joint should exist and not be part of the articulation
+        loop_idx = builder.joint_label.index("/World/env/Robot/LoopJoint")
+        self.assertEqual(builder.joint_articulation[loop_idx], -1)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_loop_joint_override(self):
+        """Loop joint body positions are correct with override_root_xform=True."""
+        stage = self._make_stage_with_loop_joint()
+        shift = (5.0, 0.0, 0.0)
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(stage, xform=wp.transform(shift, wp.quat_identity()), floating=False, override_root_xform=True)
+
+        model = builder.finalize()
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+
+        body_q = state.body_q.numpy()
+        # Override: ancestor stripped, bodies at xform + internal offsets
+        base_idx = builder.body_label.index("/World/env/Robot/Base")
+        tip_idx = builder.body_label.index("/World/env/Robot/Tip")
+        np.testing.assert_allclose(body_q[base_idx, :3], [5.0, 0.0, 0.0], atol=1e-4)
+        np.testing.assert_allclose(body_q[tip_idx, :3], [5.0, 0.0, 2.0], atol=1e-4)
+
+        loop_idx = builder.joint_label.index("/World/env/Robot/LoopJoint")
+        self.assertEqual(builder.joint_articulation[loop_idx], -1)
+
+    @staticmethod
+    def _make_stage_with_world_joint():
+        """Create a USD stage where a fixed joint connects a non-body prim to the root body.
+
+        This exercises the root-joint code path (first_joint_parent == -1) where
+        ``world_body_xform`` is derived from the non-body side of the joint.
+        """
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        env = UsdGeom.Xform.Define(stage, "/World/env")
+        env.AddTranslateOp().Set(Gf.Vec3d(100.0, 200.0, 0.0))
+
+        root = UsdGeom.Xform.Define(stage, "/World/env/Robot")
+        UsdPhysics.ArticulationRootAPI.Apply(root.GetPrim())
+
+        ground = UsdGeom.Xform.Define(stage, "/World/env/Ground")
+        ground.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.5))
+
+        base = UsdGeom.Xform.Define(stage, "/World/env/Robot/Base")
+        UsdPhysics.RigidBodyAPI.Apply(base.GetPrim())
+        UsdPhysics.MassAPI.Apply(base.GetPrim()).GetMassAttr().Set(1.0)
+
+        fixed = UsdPhysics.FixedJoint.Define(stage, "/World/env/Robot/WorldJoint")
+        fixed.CreateBody0Rel().SetTargets(["/World/env/Ground"])
+        fixed.CreateBody1Rel().SetTargets(["/World/env/Robot/Base"])
+        fixed.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        fixed.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        fixed.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        fixed.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+
+        link = UsdGeom.Xform.Define(stage, "/World/env/Robot/Link")
+        link.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 1.0))
+        UsdPhysics.RigidBodyAPI.Apply(link.GetPrim())
+        UsdPhysics.MassAPI.Apply(link.GetPrim()).GetMassAttr().Set(0.5)
+
+        rev = UsdPhysics.RevoluteJoint.Define(stage, "/World/env/Robot/RevJoint")
+        rev.CreateBody0Rel().SetTargets(["/World/env/Robot/Base"])
+        rev.CreateBody1Rel().SetTargets(["/World/env/Robot/Link"])
+        rev.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 1.0))
+        rev.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        rev.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        rev.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        rev.CreateAxisAttr().Set("Z")
+
+        return stage
+
+    @staticmethod
+    def _make_stage_with_empty_world_body0_joint():
+        """Create a USD stage where a root fixed joint leaves physics:body0 empty."""
+        from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+        stage = Usd.Stage.CreateInMemory()
+        UsdGeom.SetStageUpAxis(stage, UsdGeom.Tokens.z)
+        UsdPhysics.Scene.Define(stage, "/physicsScene")
+
+        env = UsdGeom.Xform.Define(stage, "/World/env")
+        env.AddTranslateOp().Set(Gf.Vec3d(100.0, 200.0, 0.0))
+
+        root = UsdGeom.Xform.Define(stage, "/World/env/Robot")
+        UsdPhysics.ArticulationRootAPI.Apply(root.GetPrim())
+
+        base = UsdGeom.Xform.Define(stage, "/World/env/Robot/Base")
+        base.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 0.5))
+        base.AddOrientOp().Set(
+            Gf.Quatf(0.70710677, 0.18898223, 0.37796447, 0.5669467)
+        )  # 90-deg rotation around normalized axis (1,2,3)
+        UsdPhysics.RigidBodyAPI.Apply(base.GetPrim())
+        UsdPhysics.MassAPI.Apply(base.GetPrim()).GetMassAttr().Set(1.0)
+
+        fixed = UsdPhysics.FixedJoint.Define(stage, "/World/env/Robot/WorldJointEmpty")
+        fixed.CreateBody1Rel().SetTargets(["/World/env/Robot/Base"])
+        fixed.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        fixed.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        fixed.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        fixed.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+
+        link = UsdGeom.Xform.Define(stage, "/World/env/Robot/Link")
+        link.AddTranslateOp().Set(Gf.Vec3d(0.0, 0.0, 1.0))
+        UsdPhysics.RigidBodyAPI.Apply(link.GetPrim())
+        UsdPhysics.MassAPI.Apply(link.GetPrim()).GetMassAttr().Set(0.5)
+
+        rev = UsdPhysics.RevoluteJoint.Define(stage, "/World/env/Robot/RevJoint")
+        rev.CreateBody0Rel().SetTargets(["/World/env/Robot/Base"])
+        rev.CreateBody1Rel().SetTargets(["/World/env/Robot/Link"])
+        rev.CreateLocalPos0Attr().Set(Gf.Vec3f(0.0, 0.0, 1.0))
+        rev.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+        rev.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        rev.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+        rev.CreateAxisAttr().Set("Z")
+
+        return stage
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_world_joint_default_xform(self):
+        """Root joint from non-body prim: default xform composes with ancestor transforms."""
+        stage = self._make_stage_with_world_joint()
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(stage, xform=wp.transform((5.0, 0.0, 0.0), wp.quat_identity()))
+
+        self.assertIn("/World/env/Robot/WorldJoint", builder.joint_label)
+
+        model = builder.finalize()
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+
+        body_q = state.body_q.numpy()
+        base_idx = builder.body_label.index("/World/env/Robot/Base")
+        # xform (5,0,0) composed with Ground world xform (100,200,0.5) => (105, 200, 0.5)
+        np.testing.assert_allclose(body_q[base_idx, :3], [105.0, 200.0, 0.5], atol=1e-4)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_world_joint_empty_body0_uses_child_pose(self):
+        """Root fixed joint with empty body0 keeps joint_X_p aligned with imported root pose."""
+        stage = self._make_stage_with_empty_world_body0_joint()
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(stage, xform=wp.transform((5.0, 0.0, 0.0), wp.quat_identity()))
+
+        self.assertIn("/World/env/Robot/WorldJointEmpty", builder.joint_label)
+        root_joint_idx = builder.joint_label.index("/World/env/Robot/WorldJointEmpty")
+        base_idx = builder.body_label.index("/World/env/Robot/Base")
+        assert_np_equal(
+            np.array(builder.joint_X_p[root_joint_idx].p),
+            np.array(builder.body_q[base_idx].p),
+            tol=1e-4,
+        )
+
+        model = builder.finalize()
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+        body_q = state.body_q.numpy()
+        np.testing.assert_allclose(body_q[base_idx, :3], [105.0, 200.0, 0.5], atol=1e-4)
+        # Verify rotation is preserved (sign-invariant: q and -q are equivalent)
+        # Gf.Quatf stores (w, x, y, z); body_q uses xyzw.
+        expected_quat = np.array([0.18898223, 0.37796447, 0.5669467, 0.70710677])
+        actual_quat = body_q[base_idx, 3:]
+        if np.dot(actual_quat, expected_quat) < 0:
+            actual_quat = -actual_quat
+        np.testing.assert_allclose(
+            actual_quat,
+            expected_quat,
+            atol=1e-4,
+            err_msg="Root body rotation must match USD prim orientation",
+        )
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_world_joint_override_root_xform(self):
+        """Root joint from non-body prim: override_root_xform places root at xform."""
+        stage = self._make_stage_with_world_joint()
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(
+            stage,
+            xform=wp.transform((5.0, 0.0, 0.0), wp.quat_identity()),
+            override_root_xform=True,
+        )
+
+        self.assertIn("/World/env/Robot/WorldJoint", builder.joint_label)
+
+        model = builder.finalize()
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+
+        body_q = state.body_q.numpy()
+        base_idx = builder.body_label.index("/World/env/Robot/Base")
+        # override rebases at xform; Ground z=0.5 offset from articulation root is preserved
+        np.testing.assert_allclose(body_q[base_idx, :3], [5.0, 0.0, 0.5], atol=1e-4)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_world_joint_override_with_rotation(self):
+        """Root joint from non-body prim: override with rotation rebases correctly."""
+        stage = self._make_stage_with_world_joint()
+        angle = np.pi / 2
+        quat = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), angle)
+
+        builder = newton.ModelBuilder()
+        builder.add_usd(
+            stage,
+            xform=wp.transform((5.0, 0.0, 0.0), quat),
+            override_root_xform=True,
+        )
+
+        self.assertIn("/World/env/Robot/WorldJoint", builder.joint_label)
+
+        model = builder.finalize()
+        state = model.state()
+        newton.eval_fk(model, model.joint_q, model.joint_qd, state)
+
+        body_q = state.body_q.numpy()
+        base_idx = builder.body_label.index("/World/env/Robot/Base")
+        # override rebases at xform; Ground z=0.5 offset preserved
+        np.testing.assert_allclose(body_q[base_idx, :3], [5.0, 0.0, 0.5], atol=1e-4)
+
+        link_idx = builder.body_label.index("/World/env/Robot/Link")
+        # Link at Z+1 from Base; 90° Z-rotation doesn't affect Z offset
+        np.testing.assert_allclose(body_q[link_idx, :3], [5.0, 0.0, 1.5], atol=1e-4)
+
+
+class TestImportUsdMeshNormals(unittest.TestCase):
+    """Tests for loading mesh normals from USD files."""
+
+    # A simple quad (two triangles) with faceVarying normals that should be
+    # smoothed across shared positions after vertex splitting.
+    QUAD_WITH_FACEVARYING_NORMALS = """#usda 1.0
+(
+    upAxis = "Y"
+)
+
+def Mesh "quad"
+{
+    int[] faceVertexCounts = [3, 3]
+    int[] faceVertexIndices = [0, 1, 2, 2, 1, 3]
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (1, 1, 0)]
+    normal3f[] primvars:normals = [(0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1), (0, 0, 1)] (
+        interpolation = "faceVarying"
+    )
+}
+"""
+
+    # A cube with faceVarying normals — each face has its own flat normal,
+    # but vertices at the same position should be clustered by the vertex
+    # splitting algorithm where normals are within the angle threshold.
+    CUBE_WITH_FACEVARYING_NORMALS = """#usda 1.0
+(
+    upAxis = "Y"
+)
+
+def Mesh "cube"
+{
+    int[] faceVertexCounts = [4, 4, 4, 4, 4, 4]
+    int[] faceVertexIndices = [0,1,3,2, 4,6,7,5, 0,4,5,1, 2,3,7,6, 0,2,6,4, 1,5,7,3]
+    point3f[] points = [
+        (-0.5, -0.5, -0.5), (0.5, -0.5, -0.5),
+        (-0.5, 0.5, -0.5), (0.5, 0.5, -0.5),
+        (-0.5, -0.5, 0.5), (0.5, -0.5, 0.5),
+        (-0.5, 0.5, 0.5), (0.5, 0.5, 0.5)
+    ]
+    normal3f[] primvars:normals = [
+        (0,0,-1),(0,0,-1),(0,0,-1),(0,0,-1),
+        (0,0,1),(0,0,1),(0,0,1),(0,0,1),
+        (0,-1,0),(0,-1,0),(0,-1,0),(0,-1,0),
+        (0,1,0),(0,1,0),(0,1,0),(0,1,0),
+        (-1,0,0),(-1,0,0),(-1,0,0),(-1,0,0),
+        (1,0,0),(1,0,0),(1,0,0),(1,0,0)
+    ] (
+        interpolation = "faceVarying"
+    )
+}
+"""
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_get_mesh_loads_normals_when_requested(self):
+        """get_mesh with load_normals=True produces a Mesh with non-None normals."""
+        from pxr import Usd
+
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().ImportFromString(self.QUAD_WITH_FACEVARYING_NORMALS)
+        prim = stage.GetPrimAtPath("/quad")
+
+        mesh_with = usd.get_mesh(prim, load_normals=True)
+        self.assertIsNotNone(mesh_with.normals, "Normals should be loaded when load_normals=True")
+
+        mesh_without = usd.get_mesh(prim, load_normals=False)
+        self.assertIsNone(mesh_without.normals, "Normals should be None when load_normals=False")
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_facevarying_normals_produce_correct_directions(self):
+        """faceVarying normals on a flat quad should all point in +Z."""
+        from pxr import Usd
+
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().ImportFromString(self.QUAD_WITH_FACEVARYING_NORMALS)
+        prim = stage.GetPrimAtPath("/quad")
+
+        mesh = usd.get_mesh(prim, load_normals=True)
+        normals = np.asarray(mesh.normals)
+        expected_z = np.array([0.0, 0.0, 1.0])
+        for i, n in enumerate(normals):
+            np.testing.assert_allclose(
+                n,
+                expected_z,
+                atol=1e-5,
+                err_msg=f"Normal {i} should point in +Z for a flat quad",
+            )
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_cube_facevarying_normals_vertex_splitting(self):
+        """Cube with 90-degree face angles should be split (hard edges)."""
+        from pxr import Usd
+
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().ImportFromString(self.CUBE_WITH_FACEVARYING_NORMALS)
+        prim = stage.GetPrimAtPath("/cube")
+
+        mesh = usd.get_mesh(prim, load_normals=True)
+        # The default 25-degree threshold should split all cube edges (90 degrees).
+        # Each of the 6 faces has 4 corners, triangulated to 6 indices.
+        # With all edges split, we expect 6*4=24 unique vertices.
+        self.assertEqual(len(mesh.vertices), 24)
+        # Each normal should be unit-length and axis-aligned
+        normals = np.asarray(mesh.normals)
+        lengths = np.linalg.norm(normals, axis=1)
+        np.testing.assert_allclose(lengths, 1.0, atol=1e-5)
+
+
+class TestTetMesh(unittest.TestCase):
+    def test_tetmesh_basic(self):
+        """Test TetMesh construction from raw arrays."""
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 1]], dtype=np.float32)
+        tet_indices = np.array([0, 1, 2, 3, 1, 2, 3, 4], dtype=np.int32)
+        tm = newton.TetMesh(vertices, tet_indices)
+
+        self.assertEqual(tm.vertex_count, 5)
+        self.assertEqual(tm.tet_count, 2)
+        self.assertEqual(tm.vertices.shape, (5, 3))
+        self.assertEqual(len(tm.tet_indices), 8)
+        self.assertIsNone(tm.k_mu)
+        self.assertIsNone(tm.density)
+
+    def test_tetmesh_surface_triangles(self):
+        """Test that surface triangles are correctly extracted from a single tet."""
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
+        tet_indices = np.array([0, 1, 2, 3], dtype=np.int32)
+        tm = newton.TetMesh(vertices, tet_indices)
+
+        # A single tet has 4 boundary faces = 4 surface triangles
+        self.assertEqual(len(tm.surface_tri_indices), 4 * 3)
+
+    def test_tetmesh_surface_triangles_shared_face(self):
+        """Test that shared faces between adjacent tets are eliminated."""
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 1]], dtype=np.float32)
+        tet_indices = np.array([0, 1, 2, 3, 1, 2, 3, 4], dtype=np.int32)
+        tm = newton.TetMesh(vertices, tet_indices)
+
+        # 2 tets * 4 faces = 8 total, minus 2 shared (face 1-2-3 appears in both) = 6 boundary
+        self.assertEqual(len(tm.surface_tri_indices), 6 * 3)
+
+        # Verify original winding is preserved (not lexicographically sorted)
+        tris = tm.surface_tri_indices.reshape(-1, 3)
+        sorted_tris = np.sort(tris, axis=1)
+        has_unsorted = np.any(tris != sorted_tris)
+        self.assertTrue(has_unsorted, "Surface triangles should preserve winding, not be sorted")
+
+    def test_tetmesh_material_scalar_broadcast(self):
+        """Test that scalar material values are broadcast to per-element arrays."""
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 1]], dtype=np.float32)
+        tet_indices = np.array([0, 1, 2, 3, 1, 2, 3, 4], dtype=np.int32)
+        tm = newton.TetMesh(vertices, tet_indices, k_mu=1000.0, k_lambda=2000.0, k_damp=5.0, density=1.0)
+
+        self.assertEqual(tm.k_mu.shape, (2,))
+        assert_np_equal(tm.k_mu, np.array([1000.0, 1000.0], dtype=np.float32))
+        assert_np_equal(tm.k_lambda, np.array([2000.0, 2000.0], dtype=np.float32))
+        assert_np_equal(tm.k_damp, np.array([5.0, 5.0], dtype=np.float32))
+        self.assertEqual(tm.density, 1.0)
+
+    def test_tetmesh_material_per_element(self):
+        """Test per-element material arrays."""
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 1]], dtype=np.float32)
+        tet_indices = np.array([0, 1, 2, 3, 1, 2, 3, 4], dtype=np.int32)
+        k_mu = np.array([1000.0, 5000.0], dtype=np.float32)
+        tm = newton.TetMesh(vertices, tet_indices, k_mu=k_mu)
+
+        assert_np_equal(tm.k_mu, k_mu)
+
+    def test_tetmesh_invalid_tet_indices_length(self):
+        """Test that non-multiple-of-4 tet_indices raises ValueError."""
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
+        with self.assertRaises(ValueError):
+            newton.TetMesh(vertices, np.array([0, 1, 2], dtype=np.int32))
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_get_tetmesh(self):
+        from pxr import Usd
+
+        stage = Usd.Stage.Open(os.path.join(os.path.dirname(__file__), "assets", "tetmesh_simple.usda"))
+        prim = stage.GetPrimAtPath("/SimpleTetMesh")
+        tm = usd.get_tetmesh(prim)
+
+        self.assertEqual(tm.vertex_count, 5)
+        self.assertEqual(tm.tet_count, 2)
+        self.assertEqual(tm.vertices.dtype, np.float32)
+        self.assertEqual(tm.tet_indices.dtype, np.int32)
+
+        # Check vertices
+        assert_np_equal(tm.vertices[0], np.array([0.0, 0.0, 0.0], dtype=np.float32))
+        assert_np_equal(tm.vertices[4], np.array([1.0, 1.0, 1.0], dtype=np.float32))
+
+        # Check tet indices (flattened)
+        assert_np_equal(tm.tet_indices[:4], np.array([0, 1, 2, 3], dtype=np.int32))
+        assert_np_equal(tm.tet_indices[4:], np.array([1, 2, 3, 4], dtype=np.int32))
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_tetmesh_create_from_usd(self):
+        """Test TetMesh.create_from_usd() static factory method."""
+        from pxr import Usd
+
+        stage = Usd.Stage.Open(os.path.join(os.path.dirname(__file__), "assets", "tetmesh_simple.usda"))
+        prim = stage.GetPrimAtPath("/SimpleTetMesh")
+        tm = newton.TetMesh.create_from_usd(prim)
+
+        self.assertIsInstance(tm, newton.TetMesh)
+        self.assertEqual(tm.tet_count, 2)
+        self.assertEqual(tm.vertex_count, 5)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_get_tetmesh_missing_points(self):
+        from pxr import Usd
+
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().ImportFromString(
+            """#usda 1.0
+def TetMesh "Empty" ()
+{
+    int4[] tetVertexIndices = [(0, 1, 2, 3)]
+}
+"""
+        )
+        prim = stage.GetPrimAtPath("/Empty")
+        with self.assertRaises(ValueError):
+            usd.get_tetmesh(prim)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_get_tetmesh_missing_tet_indices(self):
+        from pxr import Usd
+
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().ImportFromString(
+            """#usda 1.0
+def TetMesh "NoTets" ()
+{
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)]
+}
+"""
+        )
+        prim = stage.GetPrimAtPath("/NoTets")
+        with self.assertRaises(ValueError):
+            usd.get_tetmesh(prim)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_find_tetmesh_prims(self):
+        from pxr import Usd
+
+        stage = Usd.Stage.Open(os.path.join(os.path.dirname(__file__), "assets", "tetmesh_multi.usda"))
+        prims = usd.find_tetmesh_prims(stage)
+
+        # Should find TetA and TetB, but not NotATetMesh
+        self.assertEqual(len(prims), 2)
+        paths = sorted(str(p.GetPath()) for p in prims)
+        self.assertEqual(paths, ["/Root/TetA", "/Root/TetB"])
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_find_tetmesh_prims_load_all(self):
+        """Test loading all TetMesh prims from a multi-mesh stage."""
+        from pxr import Usd
+
+        stage = Usd.Stage.Open(os.path.join(os.path.dirname(__file__), "assets", "tetmesh_multi.usda"))
+        prims = usd.find_tetmesh_prims(stage)
+        tetmeshes = [usd.get_tetmesh(p) for p in prims]
+
+        self.assertEqual(len(tetmeshes), 2)
+        # TetA: 4 verts, 1 tet; TetB: 5 verts, 2 tets
+        counts = sorted((tm.vertex_count, tm.tet_count) for tm in tetmeshes)
+        self.assertEqual(counts, [(4, 1), (5, 2)])
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_find_tetmesh_prims_empty_stage(self):
+        from pxr import Usd
+
+        stage = Usd.Stage.CreateInMemory()
+        stage.GetRootLayer().ImportFromString(
+            """#usda 1.0
+def Mesh "JustAMesh" ()
+{
+    point3f[] points = [(0, 0, 0), (1, 0, 0), (0, 1, 0)]
+    int[] faceVertexCounts = [3]
+    int[] faceVertexIndices = [0, 1, 2]
+}
+"""
+        )
+        prims = usd.find_tetmesh_prims(stage)
+        self.assertEqual(len(prims), 0)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_get_tetmesh_with_material(self):
+        """Test that physics material properties are read from USD."""
+        from pxr import Usd
+
+        stage = Usd.Stage.Open(os.path.join(os.path.dirname(__file__), "assets", "tetmesh_with_material.usda"))
+        prim = stage.GetPrimAtPath("/World/SoftBody")
+        tm = usd.get_tetmesh(prim)
+
+        # E = 300000, nu = 0.3
+        # k_mu = E / (2 * (1 + nu)) = 300000 / 2.6 = 115384.615...
+        # k_lambda = E * nu / ((1 + nu) * (1 - 2*nu)) = 90000 / (1.3 * 0.4) = 173076.923...
+        self.assertIsNotNone(tm.k_mu)
+        self.assertIsNotNone(tm.k_lambda)
+        self.assertAlmostEqual(tm.k_mu[0], 300000.0 / (2.0 * 1.3), places=0)
+        self.assertAlmostEqual(tm.k_lambda[0], 300000.0 * 0.3 / (1.3 * 0.4), places=0)
+        self.assertAlmostEqual(tm.density, 40.0)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_get_tetmesh_no_material(self):
+        """Test that TetMesh without material binding has None material properties."""
+        from pxr import Usd
+
+        stage = Usd.Stage.Open(os.path.join(os.path.dirname(__file__), "assets", "tetmesh_simple.usda"))
+        prim = stage.GetPrimAtPath("/SimpleTetMesh")
+        tm = usd.get_tetmesh(prim)
+
+        self.assertIsNone(tm.k_mu)
+        self.assertIsNone(tm.k_lambda)
+        self.assertIsNone(tm.density)
+
+    def test_tetmesh_save_load_npz(self):
+        """Test TetMesh round-trip save/load via .npz."""
+
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
+        tet_indices = np.array([0, 1, 2, 3], dtype=np.int32)
+        tm = newton.TetMesh(vertices, tet_indices, k_mu=1000.0, k_lambda=2000.0, density=40.0)
+
+        with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as f:
+            path = f.name
+
+        try:
+            tm.save(path)
+            tm2 = newton.TetMesh.create_from_file(path)
+
+            assert_np_equal(tm2.vertices, tm.vertices)
+            assert_np_equal(tm2.tet_indices, tm.tet_indices)
+            assert_np_equal(tm2.k_mu, tm.k_mu)
+            assert_np_equal(tm2.k_lambda, tm.k_lambda)
+            self.assertAlmostEqual(tm2.density, 40.0)
+        finally:
+            os.unlink(path)
+
+    def test_tetmesh_save_load_vtk(self):
+        """Test TetMesh round-trip save/load via .vtk (meshio)."""
+
+        try:
+            import meshio  # noqa: F401
+        except ImportError:
+            self.skipTest("meshio not installed")
+
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 1]], dtype=np.float32)
+        tet_indices = np.array([0, 1, 2, 3, 1, 2, 3, 4], dtype=np.int32)
+        per_tet_region = np.array([10, 20], dtype=np.int32)
+        per_vertex_temp = np.array([1.0, 2.0, 3.0, 4.0, 5.0], dtype=np.float32)
+        tm = newton.TetMesh(
+            vertices,
+            tet_indices,
+            k_mu=1000.0,
+            k_lambda=2000.0,
+            density=40.0,
+            custom_attributes={"regionId": per_tet_region, "temperature": per_vertex_temp},
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".vtk", delete=False) as f:
+            path = f.name
+
+        try:
+            tm.save(path)
+            tm2 = newton.TetMesh.create_from_file(path)
+
+            self.assertEqual(tm2.vertex_count, 5)
+            self.assertEqual(tm2.tet_count, 2)
+            assert_np_equal(tm2.tet_indices[:4], np.array([0, 1, 2, 3], dtype=np.int32))
+            assert_np_equal(tm2.tet_indices[4:], np.array([1, 2, 3, 4], dtype=np.int32))
+
+            # Material arrays round-trip
+            self.assertIsNotNone(tm2.k_mu)
+            assert_np_equal(tm2.k_mu, np.array([1000.0, 1000.0], dtype=np.float32))
+            assert_np_equal(tm2.k_lambda, np.array([2000.0, 2000.0], dtype=np.float32))
+            self.assertAlmostEqual(tm2.density, 40.0)
+
+            # Custom attributes round-trip (check values, not just keys)
+            self.assertIn("regionId", tm2.custom_attributes)
+            self.assertIn("temperature", tm2.custom_attributes)
+            region_arr, _region_freq = tm2.custom_attributes["regionId"]
+            temp_arr, _temp_freq = tm2.custom_attributes["temperature"]
+            assert_np_equal(region_arr.flatten(), per_tet_region)
+            assert_np_equal(temp_arr.flatten(), per_vertex_temp)
+        finally:
+            os.unlink(path)
+
+    def test_tetmesh_custom_attributes_reserved_name(self):
+        """Test that reserved custom attribute names are rejected."""
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
+        tet_indices = np.array([0, 1, 2, 3], dtype=np.int32)
+
+        for reserved in ("vertices", "tet_indices", "k_mu", "k_lambda", "k_damp", "density"):
+            with self.assertRaisesRegex(ValueError, "reserved", msg=f"Should reject reserved name '{reserved}'"):
+                newton.TetMesh(vertices, tet_indices, custom_attributes={reserved: np.array([1.0])})
+
+    def test_tetmesh_custom_attributes_constructor(self):
+        """Test TetMesh stores custom attributes passed at construction."""
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
+        tet_indices = np.array([0, 1, 2, 3], dtype=np.int32)
+        temperature = np.array([100.0, 200.0, 300.0, 400.0], dtype=np.float32)
+        region_id = np.array([7], dtype=np.int32)
+
+        # Single tet: vertex_count == tri_count == 4, so temperature needs explicit frequency
+        tm = newton.TetMesh(
+            vertices,
+            tet_indices,
+            custom_attributes={
+                "temperature": (temperature, newton.Model.AttributeFrequency.PARTICLE),
+                "regionId": region_id,
+            },
+        )
+
+        self.assertIn("temperature", tm.custom_attributes)
+        self.assertIn("regionId", tm.custom_attributes)
+        arr, freq = tm.custom_attributes["temperature"]
+        assert_np_equal(arr, temperature)
+        self.assertEqual(freq, newton.Model.AttributeFrequency.PARTICLE)
+        arr, freq = tm.custom_attributes["regionId"]
+        assert_np_equal(arr, region_id)
+        self.assertEqual(freq, newton.Model.AttributeFrequency.TETRAHEDRON)
+
+    def test_tetmesh_custom_attributes_empty_by_default(self):
+        """Test TetMesh has empty custom_attributes when none are provided."""
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
+        tet_indices = np.array([0, 1, 2, 3], dtype=np.int32)
+        tm = newton.TetMesh(vertices, tet_indices)
+        self.assertEqual(len(tm.custom_attributes), 0)
+
+    @unittest.skipUnless(USD_AVAILABLE, "Requires usd-core")
+    def test_tetmesh_custom_attributes_from_usd(self):
+        """Test that custom primvars are parsed from USD into custom_attributes."""
+        from pxr import Usd
+
+        assets_dir = os.path.join(os.path.dirname(__file__), "assets")
+        stage = Usd.Stage.Open(os.path.join(assets_dir, "tetmesh_custom_attrs.usda"))
+        prim = stage.GetPrimAtPath("/TetMeshWithAttrs")
+        tm = newton.TetMesh.create_from_usd(prim)
+
+        self.assertEqual(tm.vertex_count, 5)
+        self.assertEqual(tm.tet_count, 2)
+
+        # Per-vertex temperature primvar
+        self.assertIn("temperature", tm.custom_attributes)
+        arr, freq = tm.custom_attributes["temperature"]
+        assert_np_equal(arr, np.array([100, 200, 300, 400, 500], dtype=np.float32))
+        self.assertEqual(freq, newton.Model.AttributeFrequency.PARTICLE)
+
+        # Per-tet regionId primvar
+        self.assertIn("regionId", tm.custom_attributes)
+        arr, freq = tm.custom_attributes["regionId"]
+        assert_np_equal(arr, np.array([0, 1], dtype=np.int32))
+        self.assertEqual(freq, newton.Model.AttributeFrequency.TETRAHEDRON)
+
+        # Per-vertex vector primvar
+        self.assertIn("velocityField", tm.custom_attributes)
+        arr, freq = tm.custom_attributes["velocityField"]
+        self.assertEqual(arr.shape, (5, 3))
+        self.assertEqual(freq, newton.Model.AttributeFrequency.PARTICLE)
+
+    def test_tetmesh_custom_attributes_npz_roundtrip(self):
+        """Test custom attributes survive save/load via .npz."""
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1]], dtype=np.float32)
+        tet_indices = np.array([0, 1, 2, 3], dtype=np.int32)
+        temperature = np.array([10.0, 20.0, 30.0, 40.0], dtype=np.float32)
+        region_id = np.array([3], dtype=np.int32)
+
+        # Single tet: vertex_count == tri_count == 4, so temperature needs explicit frequency
+        tm = newton.TetMesh(
+            vertices,
+            tet_indices,
+            custom_attributes={
+                "temperature": (temperature, newton.Model.AttributeFrequency.PARTICLE),
+                "regionId": region_id,
+            },
+        )
+
+        with tempfile.NamedTemporaryFile(suffix=".npz", delete=False) as f:
+            path = f.name
+
+        try:
+            tm.save(path)
+            tm2 = newton.TetMesh.create_from_file(path)
+
+            self.assertIn("temperature", tm2.custom_attributes)
+            arr, freq = tm2.custom_attributes["temperature"]
+            assert_np_equal(arr, temperature)
+            self.assertEqual(freq, newton.Model.AttributeFrequency.PARTICLE)
+            self.assertIn("regionId", tm2.custom_attributes)
+            arr, freq = tm2.custom_attributes["regionId"]
+            assert_np_equal(arr, region_id)
+            self.assertEqual(freq, newton.Model.AttributeFrequency.TETRAHEDRON)
+        finally:
+            os.unlink(path)
+
+    def test_tetmesh_custom_attributes_to_model(self):
+        """Test custom attributes flow from TetMesh through add_soft_mesh into the finalized Model."""
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 1]], dtype=np.float32)
+        tet_indices = np.array([0, 1, 2, 3, 1, 2, 3, 4], dtype=np.int32)
+
+        # Per-vertex attribute (5 vertices)
+        temperature = np.array([100.0, 200.0, 300.0, 400.0, 500.0], dtype=np.float32)
+        # Per-tet attribute (2 tets)
+        region_id = np.array([0, 1], dtype=np.int32)
+
+        tm = newton.TetMesh(
+            vertices,
+            tet_indices,
+            custom_attributes={
+                "temperature": temperature,
+                "regionId": region_id,
+            },
+        )
+
+        builder = newton.ModelBuilder()
+
+        # Register custom attributes before calling add_soft_mesh
+        builder.add_custom_attribute(
+            newton.ModelBuilder.CustomAttribute(
+                name="temperature",
+                dtype=wp.float32,
+                frequency=newton.Model.AttributeFrequency.PARTICLE,
+            )
+        )
+        builder.add_custom_attribute(
+            newton.ModelBuilder.CustomAttribute(
+                name="regionId",
+                dtype=wp.int32,
+                frequency=newton.Model.AttributeFrequency.TETRAHEDRON,
+            )
+        )
+
+        builder.add_soft_mesh(
+            mesh=tm,
+            pos=(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=(0.0, 0.0, 0.0),
+        )
+
+        model = builder.finalize()
+
+        # Verify per-vertex attribute (PARTICLE frequency)
+        self.assertTrue(hasattr(model, "temperature"))
+        temp_arr = model.temperature.numpy()
+        self.assertEqual(len(temp_arr), model.particle_count)
+        np.testing.assert_allclose(temp_arr, temperature)
+
+        # Verify per-tet attribute (TETRAHEDRON frequency)
+        self.assertTrue(hasattr(model, "regionId"))
+        region_arr = model.regionId.numpy()
+        self.assertEqual(len(region_arr), model.tet_count)
+        np.testing.assert_array_equal(region_arr, region_id)
+
+    def test_mesh_create_from_file_obj(self):
+        """Test Mesh.create_from_file with an OBJ file."""
+
+        # Write a minimal OBJ file (single triangle)
+        obj_content = "v 0.0 0.0 0.0\nv 1.0 0.0 0.0\nv 0.0 1.0 0.0\nf 1 2 3\n"
+
+        with tempfile.NamedTemporaryFile(suffix=".obj", delete=False, mode="w") as f:
+            f.write(obj_content)
+            path = f.name
+
+        try:
+            mesh = newton.Mesh.create_from_file(path)
+
+            self.assertIsInstance(mesh, newton.Mesh)
+            self.assertEqual(len(mesh.vertices), 3)
+            self.assertEqual(len(mesh.indices), 3)
+        finally:
+            os.unlink(path)
+
+    def test_mesh_create_from_file_not_found(self):
+        """Test Mesh.create_from_file raises on missing file."""
+        with self.assertRaises(FileNotFoundError):
+            newton.Mesh.create_from_file("nonexistent_file.obj")
+
+    def test_tetmesh_create_from_file_not_found(self):
+        """Test TetMesh.create_from_file raises on missing file."""
+        with self.assertRaises(FileNotFoundError):
+            newton.TetMesh.create_from_file("nonexistent_file.vtk")
+
+    # ------------------------------------------------------------------
+    # add_soft_mesh(mesh=TetMesh) builder integration
+    # ------------------------------------------------------------------
+
+    def _make_two_tet_mesh(self, **kwargs):
+        """Helper: 5 vertices, 2 tets sharing face (1,2,3)."""
+        vertices = np.array([[0, 0, 0], [1, 0, 0], [0, 1, 0], [0, 0, 1], [1, 1, 1]], dtype=np.float32)
+        tet_indices = np.array([0, 1, 2, 3, 1, 2, 3, 4], dtype=np.int32)
+        return newton.TetMesh(vertices, tet_indices, **kwargs)
+
+    def test_add_soft_mesh_with_tetmesh(self):
+        """Test add_soft_mesh accepts a TetMesh and populates the builder."""
+        tm = self._make_two_tet_mesh()
+        builder = newton.ModelBuilder()
+        builder.add_soft_mesh(
+            pos=(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=(0.0, 0.0, 0.0),
+            mesh=tm,
+        )
+        self.assertEqual(len(builder.particle_q), 5)
+        self.assertEqual(len(builder.tet_indices), 2)
+        # 6 boundary triangles (2 tets * 4 faces - 2 shared)
+        self.assertEqual(len(builder.tri_indices), 6)
+
+    def test_add_soft_mesh_tetmesh_density_override(self):
+        """Test that explicit density overrides TetMesh density."""
+        tm = self._make_two_tet_mesh(density=10.0)
+
+        # Build with TetMesh density (10.0)
+        builder_base = newton.ModelBuilder()
+        builder_base.add_soft_mesh(
+            pos=(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=(0.0, 0.0, 0.0),
+            mesh=tm,
+        )
+        mass_base = sum(builder_base.particle_mass)
+
+        # Build with overridden density (99.0)
+        builder_override = newton.ModelBuilder()
+        builder_override.add_soft_mesh(
+            pos=(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=(0.0, 0.0, 0.0),
+            mesh=tm,
+            density=99.0,
+        )
+        mass_override = sum(builder_override.particle_mass)
+
+        # Mass should scale with density ratio
+        self.assertGreater(mass_base, 0.0)
+        self.assertAlmostEqual(mass_override / mass_base, 99.0 / 10.0, places=4)
+
+    def test_add_soft_mesh_tetmesh_per_element_materials(self):
+        """Test per-element material arrays flow through to the builder."""
+        tm = self._make_two_tet_mesh(
+            k_mu=np.array([100.0, 200.0], dtype=np.float32),
+            k_lambda=np.array([300.0, 400.0], dtype=np.float32),
+            k_damp=np.array([0.1, 0.2], dtype=np.float32),
+        )
+        builder = newton.ModelBuilder()
+        builder.add_soft_mesh(
+            pos=(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=(0.0, 0.0, 0.0),
+            mesh=tm,
+        )
+        # Verify per-element values are stored
+        self.assertAlmostEqual(builder.tet_materials[0][0], 100.0)
+        self.assertAlmostEqual(builder.tet_materials[1][0], 200.0)
+        self.assertAlmostEqual(builder.tet_materials[0][1], 300.0)
+        self.assertAlmostEqual(builder.tet_materials[1][1], 400.0)
+
+    def test_add_soft_mesh_backward_compat(self):
+        """Test raw vertices/indices still work (backward compatibility)."""
+        vertices = [(0, 0, 0), (1, 0, 0), (0, 1, 0), (0, 0, 1)]
+        indices = [0, 1, 2, 3]
+        builder = newton.ModelBuilder()
+        builder.add_soft_mesh(
+            pos=(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=(0.0, 0.0, 0.0),
+            vertices=vertices,
+            indices=indices,
+            density=1.0,
+            k_mu=1000.0,
+            k_lambda=1000.0,
+            k_damp=0.0,
+        )
+        self.assertEqual(len(builder.particle_q), 4)
+        self.assertEqual(len(builder.tet_indices), 1)
+        self.assertEqual(len(builder.tri_indices), 4)
+
+    def test_add_soft_mesh_no_input_raises(self):
+        """Test ValueError when neither mesh nor vertices/indices provided."""
+        builder = newton.ModelBuilder()
+        with self.assertRaises(ValueError):
+            builder.add_soft_mesh(
+                pos=(0.0, 0.0, 0.0),
+                rot=wp.quat_identity(),
+                scale=1.0,
+                vel=(0.0, 0.0, 0.0),
+            )
+
+    def test_add_soft_mesh_invalid_mesh_type(self):
+        """Test TypeError when mesh is not a TetMesh."""
+        builder = newton.ModelBuilder()
+        with self.assertRaises(TypeError):
+            builder.add_soft_mesh(
+                pos=(0.0, 0.0, 0.0),
+                rot=wp.quat_identity(),
+                scale=1.0,
+                vel=(0.0, 0.0, 0.0),
+                mesh="not_a_tetmesh",
+            )
+
+    def test_add_soft_mesh_instancing(self):
+        """Test adding the same TetMesh twice creates independent instances."""
+        tm = self._make_two_tet_mesh(k_mu=500.0, k_lambda=500.0, density=1.0)
+        builder = newton.ModelBuilder()
+        builder.add_soft_mesh(
+            pos=(0.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=(0.0, 0.0, 0.0),
+            mesh=tm,
+        )
+        builder.add_soft_mesh(
+            pos=(2.0, 0.0, 0.0),
+            rot=wp.quat_identity(),
+            scale=1.0,
+            vel=(0.0, 0.0, 0.0),
+            mesh=tm,
+        )
+        self.assertEqual(len(builder.particle_q), 10)
+        self.assertEqual(len(builder.tet_indices), 4)
+        self.assertEqual(len(builder.tri_indices), 12)
+
+
+class TestResolveUsdFromUrl(unittest.TestCase):
+    """Tests for recursive USD reference resolution in :func:`resolve_usd_from_url`."""
+
+    def _run_resolve(self, url_to_layer, base_url="https://example.com/assets/scene.usd"):
+        """Run resolve_usd_from_url with mocked network and USD stage I/O.
+
+        Args:
+            url_to_layer: mapping from URL to USDA layer string content.
+            base_url: the top-level URL passed to resolve_usd_from_url.
+
+        Returns:
+            Tuple of (result_path, target_dir, downloaded_urls).
+        """
+        downloaded_urls = []
+
+        def fake_get(url, **_kwargs):
+            downloaded_urls.append(url)
+            resp = mock.MagicMock()
+            layer = url_to_layer.get(url)
+            if layer is None:
+                resp.status_code = 404
+                return resp
+            resp.status_code = 200
+            resp.content = layer.encode("utf-8")
+            return resp
+
+        # Map cache-relative path -> layer string so the mock stage can return it.
+        file_to_layer = {}
+        tmpdir = tempfile.mkdtemp()
+
+        # Precompute exact local-key -> layer mapping from URLs.
+        base_url_dir = base_url.rsplit("/", 1)[0]
+        local_key_to_layer = {}
+        for url, layer in url_to_layer.items():
+            if url.startswith(base_url_dir + "/"):
+                local_key_to_layer[url[len(base_url_dir) + 1 :]] = layer
+
+        def _local_key(path):
+            return os.path.relpath(path, tmpdir).replace(os.sep, "/")
+
+        def fake_stage_open(path, _load_policy):
+            layer_str = file_to_layer.get(_local_key(path), "")
+            stage = mock.MagicMock()
+            stage.GetRootLayer().ExportToString.return_value = layer_str
+            return stage
+
+        # Track writes so we can populate file_to_layer when the function
+        # writes a downloaded file to disk.
+        real_open = open
+
+        def tracking_open(path, mode="r", **kwargs):
+            fh = real_open(path, mode, **kwargs)
+            if "w" in mode or "b" in mode:
+                key = _local_key(path)
+                if key in local_key_to_layer:
+                    file_to_layer[key] = local_key_to_layer[key]
+            return fh
+
+        mock_requests = mock.MagicMock()
+        mock_requests.get = fake_get
+
+        mock_usd = mock.MagicMock()
+        mock_usd.Stage.Open = fake_stage_open
+        mock_usd.Stage.LoadNone = None
+
+        mock_pxr = mock.MagicMock()
+        mock_pxr.Usd = mock_usd
+
+        from newton._src.utils.import_usd import resolve_usd_from_url  # noqa: PLC0415
+
+        with (
+            mock.patch.dict(
+                "sys.modules",
+                {"requests": mock_requests, "pxr": mock_pxr, "pxr.Usd": mock_usd},
+            ),
+            mock.patch("builtins.open", tracking_open),
+        ):
+            result = resolve_usd_from_url(base_url, target_folder_name=tmpdir)
+
+        return result, tmpdir, downloaded_urls
+
+    def test_single_level_references(self):
+        """References in the root stage are downloaded."""
+        url_to_layer = {
+            "https://example.com/assets/scene.usd": "references = @./child_a.usd@\nreferences = @./child_b.usd@",
+            "https://example.com/assets/child_a.usd": "",
+            "https://example.com/assets/child_b.usd": "",
+        }
+        _result, tmpdir, downloaded_urls = self._run_resolve(url_to_layer)
+        self.assertIn("https://example.com/assets/child_a.usd", downloaded_urls)
+        self.assertIn("https://example.com/assets/child_b.usd", downloaded_urls)
+        self.assertTrue(os.path.exists(os.path.join(tmpdir, "child_a.usd")))
+        self.assertTrue(os.path.exists(os.path.join(tmpdir, "child_b.usd")))
+
+    def test_recursive_references(self):
+        """References in child stages are resolved recursively."""
+        url_to_layer = {
+            "https://example.com/assets/scene.usd": "references = @./robot.usd@",
+            "https://example.com/assets/robot.usd": "references = @./collisions.usd@",
+            "https://example.com/assets/collisions.usd": "",
+        }
+        _result, tmpdir, downloaded_urls = self._run_resolve(url_to_layer)
+        self.assertIn("https://example.com/assets/robot.usd", downloaded_urls)
+        self.assertIn("https://example.com/assets/collisions.usd", downloaded_urls)
+        self.assertTrue(os.path.exists(os.path.join(tmpdir, "collisions.usd")))
+
+    def test_deep_recursive_references(self):
+        """Three levels of nesting are resolved."""
+        url_to_layer = {
+            "https://example.com/assets/scene.usd": "references = @./level1.usd@",
+            "https://example.com/assets/level1.usd": "references = @./level2.usd@",
+            "https://example.com/assets/level2.usd": "references = @./level3.usd@",
+            "https://example.com/assets/level3.usd": "",
+        }
+        _result, tmpdir, downloaded_urls = self._run_resolve(url_to_layer)
+        self.assertIn("https://example.com/assets/level3.usd", downloaded_urls)
+        self.assertTrue(os.path.exists(os.path.join(tmpdir, "level3.usd")))
+
+    def test_no_duplicate_downloads(self):
+        """The same reference appearing in multiple stages is downloaded only once."""
+        url_to_layer = {
+            "https://example.com/assets/scene.usd": "references = @./a.usd@\nreferences = @./b.usd@",
+            "https://example.com/assets/a.usd": "references = @./shared.usd@",
+            "https://example.com/assets/b.usd": "references = @./shared.usd@",
+            "https://example.com/assets/shared.usd": "",
+        }
+        _result, _tmpdir, downloaded_urls = self._run_resolve(url_to_layer)
+        shared_downloads = [u for u in downloaded_urls if u.endswith("shared.usd")]
+        self.assertEqual(len(shared_downloads), 1)
+
+    def test_cyclic_references(self):
+        """Cyclic references (including back to root) do not cause infinite recursion."""
+        url_to_layer = {
+            "https://example.com/assets/scene.usd": "references = @./a.usd@",
+            "https://example.com/assets/a.usd": "references = @./b.usd@",
+            "https://example.com/assets/b.usd": "references = @./scene.usd@",
+        }
+        _result, _tmpdir, downloaded_urls = self._run_resolve(url_to_layer)
+        # Root URL is fetched once at the top level; recursive refs back to it must not re-download.
+        self.assertEqual(downloaded_urls.count("https://example.com/assets/scene.usd"), 1)
+        self.assertEqual(downloaded_urls.count("https://example.com/assets/a.usd"), 1)
+        self.assertEqual(downloaded_urls.count("https://example.com/assets/b.usd"), 1)
+
+    def test_nested_subdirectory_references(self):
+        """References in subdirectories preserve correct local paths."""
+        url_to_layer = {
+            "https://example.com/assets/scene.usd": "references = @robots/robot.usd@",
+            "https://example.com/assets/robots/robot.usd": "references = @./collisions.usd@",
+            "https://example.com/assets/robots/collisions.usd": "",
+        }
+        _result, tmpdir, downloaded_urls = self._run_resolve(url_to_layer)
+        self.assertIn("https://example.com/assets/robots/collisions.usd", downloaded_urls)
+        # collisions.usd must be inside robots/, not at cache root
+        self.assertTrue(os.path.exists(os.path.join(tmpdir, "robots", "collisions.usd")))
+        self.assertFalse(os.path.exists(os.path.join(tmpdir, "collisions.usd")))
+
+    def test_path_traversal_rejected(self):
+        """References with .. that escape the target folder are skipped."""
+        url_to_layer = {
+            "https://example.com/assets/scene.usd": "references = @../secret.usd@",
+        }
+        _result, tmpdir, downloaded_urls = self._run_resolve(url_to_layer)
+        # Escaped reference must not be fetched or written.
+        escaped_urls = [u for u in downloaded_urls if "secret.usd" in u]
+        self.assertEqual(len(escaped_urls), 0)
+        self.assertFalse(os.path.exists(os.path.join(tmpdir, "..", "secret.usd")))
 
 
 if __name__ == "__main__":

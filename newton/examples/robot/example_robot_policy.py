@@ -38,14 +38,9 @@ import warp as wp
 import yaml
 
 import newton
-
-# Test: Disable CUDA-OpenGL interop to see if that fixes the issue
-import newton._src.viewer.gl.opengl as opengl_module
 import newton.examples
 import newton.utils
-from newton import ActuatorMode, State
-
-opengl_module.ENABLE_CUDA_INTEROP = False
+from newton import JointTargetMode, State
 
 
 @dataclass
@@ -262,7 +257,7 @@ class Example:
             builder.joint_target_ke[i + 6] = config["mjw_joint_stiffness"][i]
             builder.joint_target_kd[i + 6] = config["mjw_joint_damping"][i]
             builder.joint_armature[i + 6] = config["mjw_joint_armature"][i]
-            builder.joint_act_mode[i + 6] = int(ActuatorMode.POSITION)
+            builder.joint_target_mode[i + 6] = int(JointTargetMode.POSITION)
 
         self.model = builder.finalize()
         self.model.set_gravity((0.0, 0.0, -9.81))
@@ -280,7 +275,7 @@ class Example:
         self.state_0 = self.model.state()
         self.state_1 = self.model.state()
         self.control = self.model.control()
-        self.contacts = self.model.contacts()
+        self.contacts = newton.Contacts(self.solver.get_max_contact_count(), 0)
 
         # Set model in viewer
         self.viewer.set_model(self.model)
@@ -325,8 +320,6 @@ class Example:
 
     def simulate(self):
         """Simulate performs one frame's worth of updates."""
-        self.model.collide(self.state_0, self.contacts)
-
         need_state_copy = self.use_cuda_graph and self.sim_substeps % 2 == 1
 
         for i in range(self.sim_substeps):
@@ -335,7 +328,7 @@ class Example:
             # Apply forces to the model for picking, wind, etc
             self.viewer.apply_forces(self.state_0)
 
-            self.solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
+            self.solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
 
             # Swap states - handle CUDA graph case specially
             if need_state_copy and i == self.sim_substeps - 1:
@@ -344,6 +337,8 @@ class Example:
             else:
                 # We can just swap the state references
                 self.state_0, self.state_1 = self.state_1, self.state_0
+
+        self.solver.update_contacts(self.contacts, self.state_0)
 
     def reset(self):
         print("[INFO] Resetting example")
