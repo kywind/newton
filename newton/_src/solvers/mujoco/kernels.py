@@ -404,6 +404,8 @@ def convert_mj_coords_to_warp_kernel(
     joint_type: wp.array(dtype=wp.int32),
     joint_q_start: wp.array(dtype=wp.int32),
     joint_qd_start: wp.array(dtype=wp.int32),
+    joint_q_start_mjc: wp.array(dtype=wp.int32),
+    joint_qd_start_mjc: wp.array(dtype=wp.int32),
     joint_dof_dim: wp.array(dtype=wp.int32, ndim=2),
     joint_child: wp.array(dtype=wp.int32),
     body_com: wp.array(dtype=wp.vec3),
@@ -415,8 +417,8 @@ def convert_mj_coords_to_warp_kernel(
     worldid, jntid = wp.tid()
 
     type = joint_type[jntid]
-    q_i = joint_q_start[jntid]
-    qd_i = joint_qd_start[jntid]
+    q_i = joint_q_start_mjc[jntid]
+    qd_i = joint_qd_start_mjc[jntid]
     wq_i = joint_q_start[joints_per_world * worldid + jntid]
     wqd_i = joint_qd_start[joints_per_world * worldid + jntid]
 
@@ -506,6 +508,8 @@ def convert_warp_coords_to_mj_kernel(
     joint_type: wp.array(dtype=wp.int32),
     joint_q_start: wp.array(dtype=wp.int32),
     joint_qd_start: wp.array(dtype=wp.int32),
+    joint_q_start_mjc: wp.array(dtype=wp.int32),
+    joint_qd_start_mjc: wp.array(dtype=wp.int32),
     joint_dof_dim: wp.array(dtype=wp.int32, ndim=2),
     joint_child: wp.array(dtype=wp.int32),
     body_com: wp.array(dtype=wp.vec3),
@@ -517,8 +521,8 @@ def convert_warp_coords_to_mj_kernel(
     worldid, jntid = wp.tid()
 
     type = joint_type[jntid]
-    q_i = joint_q_start[jntid]
-    qd_i = joint_qd_start[jntid]
+    q_i = joint_q_start_mjc[jntid]
+    qd_i = joint_qd_start_mjc[jntid]
     wq_i = joint_q_start[joints_per_world * worldid + jntid]
     wqd_i = joint_qd_start[joints_per_world * worldid + jntid]
 

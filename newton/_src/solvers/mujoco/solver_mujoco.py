@@ -2540,6 +2540,10 @@ class SolverMuJoCo(SolverBase):
         """Mapping from MuJoCo [world, joint] to Newton DOF index. Shape [nworld, njnt], dtype int32."""
         self.mjc_dof_to_newton_dof: wp.array(dtype=wp.int32, ndim=2) | None = None
         """Mapping from MuJoCo [world, dof] to Newton DOF index. Shape [nworld, nv], dtype int32."""
+        self.joint_q_start_mjc: wp.array(dtype=wp.int32) | None = None
+        """MuJoCo-compacted template q_start per joint (cable DOFs excluded). Shape [joints_per_world], dtype int32."""
+        self.joint_qd_start_mjc: wp.array(dtype=wp.int32) | None = None
+        """MuJoCo-compacted template qd_start per joint (cable DOFs excluded). Shape [joints_per_world], dtype int32."""
         self.mjc_actuator_ctrl_source: wp.array(dtype=wp.int32) | None = None
         """Control source for each MuJoCo actuator.
 
@@ -2903,9 +2907,10 @@ class SolverMuJoCo(SolverBase):
             qvel = mj_data.qvel
             nworld = mj_data.nworld
         else:
-            # we have an MjData object from Mujoco
-            qpos = wp.empty((1, model.joint_coord_count), dtype=wp.float32, device=model.device)
-            qvel = wp.empty((1, model.joint_dof_count), dtype=wp.float32, device=model.device)
+            # Allocate MuJoCo-sized buffers directly so the kernel writes at compacted
+            # MuJoCo indices and no post-processing compaction step is needed.
+            qpos = wp.empty((1, len(mj_data.qpos)), dtype=wp.float32, device=model.device)
+            qvel = wp.empty((1, len(mj_data.qvel)), dtype=wp.float32, device=model.device)
             nworld = 1
         if state is None:
             joint_q = model.joint_q
@@ -2913,7 +2918,7 @@ class SolverMuJoCo(SolverBase):
         else:
             joint_q = state.joint_q
             joint_qd = state.joint_qd
-        joints_per_world = model.joint_count // nworld
+        joints_per_world = model.joint_count // model.world_count
         mujoco_attrs = getattr(model, "mujoco", None)
         dof_ref = getattr(mujoco_attrs, "dof_ref", None) if mujoco_attrs is not None else None
         wp.launch(
@@ -2926,6 +2931,8 @@ class SolverMuJoCo(SolverBase):
                 model.joint_type,
                 model.joint_q_start,
                 model.joint_qd_start,
+                self.joint_q_start_mjc,
+                self.joint_qd_start_mjc,
                 model.joint_dof_dim,
                 model.joint_child,
                 model.body_com,
@@ -2935,27 +2942,8 @@ class SolverMuJoCo(SolverBase):
             device=model.device,
         )
         if not is_mjwarp:
-            # NEW: filter out cable values
-            qpos_flat = qpos.numpy().flatten()
-            qvel_flat = qvel.numpy().flatten()
-
-            joint_type = model.joint_type.numpy()
-            joint_q_start = model.joint_q_start.numpy()
-            joint_qd_start = model.joint_qd_start.numpy()
-            joint_dof_dim = model.joint_dof_dim.numpy()
-
-            id_delta = 0
-            for j in range(joint_type.shape[0]):
-                if joint_type[j] == JointType.CABLE:
-                    id_delta += joint_dof_dim[j][0] + joint_dof_dim[j][1]
-                else:
-                    qpos_flat[joint_q_start[j]-id_delta:joint_q_start[j+1]-id_delta] = \
-                        qpos_flat[joint_q_start[j]:joint_q_start[j+1]]
-                    qvel_flat[joint_qd_start[j]-id_delta:joint_qd_start[j+1]-id_delta] = \
-                        qvel_flat[joint_qd_start[j]:joint_qd_start[j+1]]
-
-            mj_data.qpos[:] = qpos_flat[: len(mj_data.qpos)]
-            mj_data.qvel[:] = qvel_flat[: len(mj_data.qvel)]
+            mj_data.qpos[:] = qpos.numpy().flatten()
+            mj_data.qvel[:] = qvel.numpy().flatten()
 
     def _update_newton_state(
         self,
@@ -2974,7 +2962,7 @@ class SolverMuJoCo(SolverBase):
             qpos = wp.array([mj_data.qpos], dtype=wp.float32, device=model.device)
             qvel = wp.array([mj_data.qvel], dtype=wp.float32, device=model.device)
             nworld = 1
-        joints_per_world = model.joint_count // nworld
+        joints_per_world = model.joint_count // model.world_count
         mujoco_attrs = getattr(model, "mujoco", None)
         dof_ref = getattr(mujoco_attrs, "dof_ref", None) if mujoco_attrs is not None else None
         wp.launch(
@@ -2987,6 +2975,8 @@ class SolverMuJoCo(SolverBase):
                 model.joint_type,
                 model.joint_q_start,
                 model.joint_qd_start,
+                self.joint_q_start_mjc,
+                self.joint_qd_start_mjc,
                 model.joint_dof_dim,
                 model.joint_child,
                 model.body_com,
@@ -3484,6 +3474,7 @@ class SolverMuJoCo(SolverBase):
         joint_type = model.joint_type.numpy()
         joint_axis = model.joint_axis.numpy()
         joint_dof_dim = model.joint_dof_dim.numpy()
+        joint_q_start = model.joint_q_start.numpy()
         joint_qd_start = model.joint_qd_start.numpy()
         joint_armature = model.joint_armature.numpy()
         joint_effort_limit = model.joint_effort_limit.numpy()
@@ -3513,14 +3504,32 @@ class SolverMuJoCo(SolverBase):
         shape_mu_rolling = model.shape_material_mu_rolling.numpy()
         shape_thickness = model.shape_thickness.numpy()
 
-        # NEW: change joint_dof_dim and joint_qd_start to deal with cables
-        first_cable_idx = None
-        for j in range(joint_type.shape[0]):
+        # change joint_dof_dim and joint_qd_start to deal with cables (world-0 template only)
+        joints_per_world = model.joint_count // model.world_count
+
+        # Compute MuJoCo-compacted q/qd start arrays (template world only, cable DOFs excluded).
+        # Kernels use joint_q_start[jntid] as the MuJoCo qpos/qvel index, but Newton's
+        # joint_q_start includes cable q entries. Build compacted arrays so each non-cable
+        # joint's index is shifted down by the q/qd count of all preceding cable joints.
+        # Must be computed BEFORE the cable patch below modifies joint_dof_dim.
+        joint_q_start_mjc_np = joint_q_start[:joints_per_world].copy()
+        joint_qd_start_mjc_np = joint_qd_start[:joints_per_world].copy()
+        q_delta = 0
+        qd_delta = 0
+        for j in range(joints_per_world):
             if joint_type[j] == JointType.CABLE:
-                if first_cable_idx is None:
-                    first_cable_idx = j
-                joint_dof_dim[j] = [0, 0]  # Cables have no DOFs
-                joint_qd_start[j] = joint_qd_start[first_cable_idx]  # Point to the first cable's DOFs
+                q_delta += int(joint_q_start[j + 1]) - int(joint_q_start[j])
+                qd_delta += int(joint_dof_dim[j][0]) + int(joint_dof_dim[j][1])
+            else:
+                joint_q_start_mjc_np[j] -= q_delta
+                joint_qd_start_mjc_np[j] -= qd_delta
+        self.joint_q_start_mjc = wp.array(joint_q_start_mjc_np, dtype=wp.int32, device=model.device)
+        self.joint_qd_start_mjc = wp.array(joint_qd_start_mjc_np, dtype=wp.int32, device=model.device)
+
+        # Zero out DOF dims for cable joints so DOF mapping tables skip them.
+        for j in range(joints_per_world * model.world_count):
+            if joint_type[j] == JointType.CABLE:
+                joint_dof_dim[j] = [0, 0]
 
         # retrieve MuJoCo-specific attributes
         mujoco_attrs = getattr(model, "mujoco", None)
