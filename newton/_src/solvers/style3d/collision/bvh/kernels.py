@@ -94,18 +94,23 @@ def aabb_vs_aabb_kernel(
     ignore_self_hits: bool,
     lower_bounds: wp.array(dtype=wp.vec3),
     upper_bounds: wp.array(dtype=wp.vec3),
+    query_world: wp.array(dtype=int),
+    leaf_world: wp.array(dtype=int),
     # outputs
     query_results: wp.array(dtype=int, ndim=2),
 ):
     tid = wp.int32(wp.tid())
     lower = lower_bounds[tid] - wp.vec3(query_radius)
     upper = upper_bounds[tid] + wp.vec3(query_radius)
+    my_world = query_world[tid]
 
     query_count = wp.int32(0)
     query_index = wp.int32(-1)
     query = wp.bvh_query_aabb(bvh_id, lower, upper)
 
     while (query_count < query_list_rows - 1) and wp.bvh_query_next(query, query_index):
+        if leaf_world[query_index] != my_world:
+            continue
         if not (ignore_self_hits and query_index <= tid):
             query_results[query_count + 1, tid] = query_index
             query_count += 1
@@ -152,6 +157,7 @@ def triangle_vs_point_kernel(
     pos: wp.array(dtype=wp.vec3),
     tri_pos: wp.array(dtype=wp.vec3),
     tri_indices: wp.array(dtype=int, ndim=2),
+    particle_world: wp.array(dtype=int),
     # outputs
     query_results: wp.array(dtype=int, ndim=2),
 ):
@@ -160,6 +166,7 @@ def triangle_vs_point_kernel(
     x0 = pos[vid]
     lower = x0 - wp.vec3(query_radius)
     upper = x0 + wp.vec3(query_radius)
+    my_world = particle_world[vid]
 
     tri_index = wp.int32(-1)
     query_count = wp.int32(0)
@@ -169,6 +176,8 @@ def triangle_vs_point_kernel(
         t1 = tri_indices[tri_index, 0]
         t2 = tri_indices[tri_index, 1]
         t3 = tri_indices[tri_index, 2]
+        if particle_world[t1] != my_world:
+            continue
         if ignore_self_hits and vertex_adjacent_to_triangle(vid, t1, t2, t3):
             continue
 
@@ -194,6 +203,7 @@ def edge_vs_edge_kernel(
     test_edge_indices: wp.array(dtype=int, ndim=2),
     edge_pos: wp.array(dtype=wp.vec3),
     edge_indices: wp.array(dtype=int, ndim=2),
+    particle_world: wp.array(dtype=int),
     # outputs
     query_results: wp.array(dtype=int, ndim=2),
 ):
@@ -204,6 +214,7 @@ def edge_vs_edge_kernel(
 
     x0 = test_pos[v0]
     x1 = test_pos[v1]
+    my_world = particle_world[v0]
 
     lower = wp.min(x0, x1) - wp.vec3(query_radius)
     upper = wp.max(x0, x1) + wp.vec3(query_radius)
@@ -217,6 +228,8 @@ def edge_vs_edge_kernel(
             continue
         v2 = edge_indices[edge_index, 2]
         v3 = edge_indices[edge_index, 3]
+        if particle_world[v2] != my_world:
+            continue
         if ignore_self_hits and (v0 == v2 or v0 == v3 or v1 == v2 or v1 == v3):
             continue
 

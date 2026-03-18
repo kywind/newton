@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import numpy as np
 import warp as wp
 
 from newton import Contacts, Model, State
@@ -59,6 +60,18 @@ class Collision:
 
         self.Hx = wp.zeros(model.particle_count, dtype=wp.vec3, device=self.model.device)
         self.contact_hessian_diags = wp.zeros(model.particle_count, dtype=wp.mat33, device=self.model.device)
+
+        # Per-element world arrays for multi-world collision filtering
+        self.particle_world = model.particle_world
+        particle_world_np = model.particle_world.numpy()
+        tri_indices_np = model.tri_indices.numpy()  # (T, 3)
+        edge_indices_np = model.edge_indices.numpy()  # (E, 4)
+        self.tri_world = wp.array(
+            particle_world_np[tri_indices_np[:, 0]], dtype=int, device=self.model.device
+        )
+        self.edge_world = wp.array(
+            particle_world_np[edge_indices_np[:, 2]], dtype=int, device=self.model.device
+        )
 
         self.edge_bvh.build(model.particle_q, self.model.edge_indices, self.radius)
         self.tri_bvh.build(model.particle_q, self.model.tri_indices, self.radius)
@@ -107,6 +120,7 @@ class Collision:
                 True,
                 max_dist,
                 query_radius,
+                particle_world=self.particle_world,
             )
 
         # Edge-edge collision candidates
@@ -120,6 +134,7 @@ class Collision:
                 True,
                 max_dist,
                 query_radius,
+                particle_world=self.particle_world,
             )
 
         # Face-edge collision candidates
@@ -130,6 +145,8 @@ class Collision:
                 self.broad_phase_ef,
                 query_radius,
                 False,
+                query_world=self.edge_world,
+                leaf_world=self.tri_world,
             )
 
     def accumulate_contact_force(

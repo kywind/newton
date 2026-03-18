@@ -144,6 +144,8 @@ class BvhAabb:
         query_results: wp.array(dtype=int, ndim=2),
         query_radius: float = 0.0,
         ignore_self_hits: bool = False,
+        query_world: wp.array(dtype=int) = None,
+        leaf_world: wp.array(dtype=int) = None,
     ):
         """Queries the BVH for overlapping AABBs.
 
@@ -161,6 +163,10 @@ class BvhAabb:
             query_results (wp.array): 2D integer array for storing results [max_results + 1, num_queries].
             query_radius (float, optional): Additional padding radius to apply to each query AABB.
             ignore_self_hits (bool, optional): If True, suppresses self-intersections (e.g., for symmetric queries).
+            query_world (wp.array, optional): Per-query-element world index array for multi-world filtering.
+                Must be provided together with ``leaf_world``.
+            leaf_world (wp.array, optional): Per-BVH-leaf world index array for multi-world filtering.
+                Must be provided together with ``query_world``.
 
         Note:
             - query_results.shape[1] must be ≥ number of aabbs (i.e., lower_bounds.shape[0]).
@@ -172,10 +178,24 @@ class BvhAabb:
         assert lower_bounds.shape == upper_bounds.shape, "lower_bounds and upper_bounds must have the same shape."
         assert self.bvh is not None, "BVH has not been built. Call build() or refit() first."
         # ================================    Runtime checks    ================================
+        # Default to single-world (all zeros) when world arrays are not provided
+        if query_world is None:
+            query_world = wp.zeros(lower_bounds.shape[0], dtype=int, device=self.device)
+        if leaf_world is None:
+            leaf_world = wp.zeros(self.lower_bounds.shape[0], dtype=int, device=self.device)
         wp.launch(
             aabb_vs_aabb_kernel,
             dim=lower_bounds.shape[0],
-            inputs=[self.bvh.id, query_results.shape[0], query_radius, ignore_self_hits, lower_bounds, upper_bounds],
+            inputs=[
+                self.bvh.id,
+                query_results.shape[0],
+                query_radius,
+                ignore_self_hits,
+                lower_bounds,
+                upper_bounds,
+                query_world,
+                leaf_world,
+            ],
             outputs=[query_results],
             device=self.device,
             block_dim=64,
@@ -335,6 +355,7 @@ class BvhEdge(BvhAabb):
         ignore_self_hits: bool,
         max_dist: float,
         query_radius: float = 0.0,
+        particle_world: wp.array(dtype=int) = None,
     ):
         """Queries the BVH to find edges that are within a maximum distance from a set of points.
 
@@ -356,7 +377,12 @@ class BvhEdge(BvhAabb):
             ignore_self_hits (bool): If True, skips hits between a point and its associated triangle (e.g. for self-collision).
             max_dist (float): Maximum allowed distance between point and triangle for a match to be considered.
             query_radius (float): Optional padding to enlarge triangle AABBs during the query (default: 0.0).
+            particle_world (wp.array, optional): Per-particle world index array for multi-world filtering.
+                When provided, only edges belonging to the same world as the query edge are reported.
         """
+        # Default to single-world (all zeros) when particle_world is not provided
+        if particle_world is None:
+            particle_world = wp.zeros(test_pos.shape[0], dtype=int, device=self.device)
         wp.launch(
             edge_vs_edge_kernel,
             dim=test_edge_indices.shape[0],
@@ -370,6 +396,7 @@ class BvhEdge(BvhAabb):
                 test_edge_indices,
                 edge_pos,
                 edge_indices,
+                particle_world,
             ],
             outputs=[query_results],
             device=self.device,
@@ -481,6 +508,7 @@ class BvhTri(BvhAabb):
         ignore_self_hits: bool,
         max_dist: float,
         query_radius: float = 0.0,
+        particle_world: wp.array(dtype=int) = None,
     ):
         """Queries the BVH to find triangles that are within a maximum distance from a set of points.
 
@@ -501,11 +529,16 @@ class BvhTri(BvhAabb):
             ignore_self_hits (bool): If True, skips hits between a point and its associated triangle (e.g. for self-collision).
             max_dist (float): Maximum allowed distance between point and triangle for a match to be considered.
             query_radius (float): Optional padding to enlarge triangle AABBs during the query (default: 0.0).
+            particle_world (wp.array, optional): Per-particle world index array for multi-world filtering.
+                When provided, only triangles belonging to the same world as the query vertex are reported.
         """
         # ================================    Runtime checks    ================================
         assert tri_indices.shape[1] == 3, f"tri_indices must be of shape (M, 3), got {tri_indices.shape}"
         assert tri_indices.shape[0] == self.lower_bounds.shape[0], "Mismatch between triangle count and BVH leaf count."
         # ================================    Runtime checks    ================================
+        # Default to single-world (all zeros) when particle_world is not provided
+        if particle_world is None:
+            particle_world = wp.zeros(pos.shape[0], dtype=int, device=self.device)
         wp.launch(
             triangle_vs_point_kernel,
             dim=pos.shape[0],
@@ -518,6 +551,7 @@ class BvhTri(BvhAabb):
                 pos,
                 tri_pos,
                 tri_indices,
+                particle_world,
             ],
             outputs=[query_results],
             device=self.device,

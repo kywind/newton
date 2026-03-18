@@ -1374,11 +1374,32 @@ class ViewerBase:
 
         self.log_points("/model/com", self._com_positions, self._com_radii, self._com_colors, hidden=not self.show_com)
 
+    def _get_offset_particle_q(self, state):
+        """Return particle positions with world offsets applied for rendering."""
+        if self.world_offsets is None or not hasattr(self.model, "particle_world"):
+            return state.particle_q
+
+        if not hasattr(self, "_offset_particle_q") or self._offset_particle_q is None:
+            self._offset_particle_q = wp.zeros(
+                self.model.particle_count, dtype=wp.vec3, device=self.device
+            )
+
+        from .kernels import offset_particle_positions  # noqa: PLC0415
+
+        wp.launch(
+            offset_particle_positions,
+            dim=self.model.particle_count,
+            inputs=[state.particle_q, self.model.particle_world, self.world_offsets],
+            outputs=[self._offset_particle_q],
+            device=self.device,
+        )
+        return self._offset_particle_q
+
     def _log_triangles(self, state):
         if self.model.tri_count:
             self.log_mesh(
                 "/model/triangles",
-                state.particle_q,
+                self._get_offset_particle_q(state),
                 self.model.tri_indices.flatten(),
                 hidden=not self.show_triangles,
                 backface_culling=False,
@@ -1394,7 +1415,7 @@ class ViewerBase:
 
             self.log_points(
                 name="/model/particles",
-                points=state.particle_q,
+                points=self._get_offset_particle_q(state),
                 radii=self.model.particle_radius,
                 colors=colors,
                 hidden=not self.show_particles,

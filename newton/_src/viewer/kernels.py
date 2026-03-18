@@ -449,6 +449,22 @@ def compute_com_positions(
     com_positions[tid] = world_com
 
 
+@wp.kernel
+def offset_particle_positions(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_world: wp.array(dtype=int),
+    world_offsets: wp.array(dtype=wp.vec3),
+    # output
+    particle_q_offset: wp.array(dtype=wp.vec3),
+):
+    tid = wp.tid()
+    pos = particle_q[tid]
+    world_idx = particle_world[tid]
+    if world_offsets and world_idx >= 0 and world_idx < world_offsets.shape[0]:
+        pos = pos + world_offsets[world_idx]
+    particle_q_offset[tid] = pos
+
+
 @wp.func
 def depth_to_color(depth: float, min_depth: float, max_depth: float) -> wp.vec3:
     """Convert depth value to a color using a blue-to-red colormap."""
