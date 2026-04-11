@@ -62,9 +62,87 @@ class Camera:
         self.pitch = 0.0
         self.yaw = -180.0
 
+        # Optional override set via set_rotation(); bypasses pitch/yaw when not None.
+        self._custom_front = None  # np.ndarray shape (3,)
+        self._custom_up = None     # np.ndarray shape (3,)
+
+        # Optional override set via set_intrinsics(); bypasses FOV-based projection when not None.
+        # Stored as flat 16-element array in column-major order (same format as pyglet Mat4).
+        self._custom_projection = None
+
+    def set_rotation(self, R: np.ndarray) -> None:
+        """Set camera orientation from a 3x3 camera-to-world rotation matrix.
+
+        Uses OpenCV/RealSense column convention:
+          R[:, 0]  camera +X (right)    in world
+          R[:, 1]  camera +Y (down)     in world
+          R[:, 2]  camera +Z (forward)  in world
+
+        Overrides pitch/yaw until :meth:`clear_rotation` is called.
+
+        Args:
+            R: Camera-to-world rotation matrix, shape (3, 3).
+        """
+        R = np.asarray(R, dtype=np.float64).reshape(3, 3)
+        self._custom_front = R[:, 2].copy()
+        self._custom_up = -R[:, 1].copy()  # OpenCV Y is down; negate for viewer up
+
+    def clear_rotation(self) -> None:
+        """Revert to pitch/yaw orientation control."""
+        self._custom_front = None
+        self._custom_up = None
+
+    def set_intrinsics(self, fx: float, fy: float, cx: float, cy: float) -> None:
+        """Set camera intrinsics from an OpenCV pinhole camera matrix.
+
+        Constructs an off-axis OpenGL frustum so that the rendered image matches
+        the real camera exactly (including principal point offset).  Overrides the
+        symmetric FOV-based projection until :meth:`clear_intrinsics` is called.
+
+        Uses the current ``width``, ``height``, ``near``, and ``far`` values, so
+        call this *after* setting those.
+
+        Args:
+            fx: Focal length along x [px].
+            fy: Focal length along y [px].
+            cx: Principal point x [px].
+            cy: Principal point y [px].
+        """
+        w, h = float(self.width), float(self.height)
+        n, f = float(self.near), float(self.far)
+
+        # Map OpenCV image-plane corners to view-space frustum planes.
+        # OpenCV: origin top-left, Y down.  OpenGL NDC: origin centre, Y up.
+        left   = -(cx / fx) * n
+        right  =  ((w - cx) / fx) * n
+        bottom = -((h - cy) / fy) * n
+        top    =  (cy / fy) * n
+
+        rl = right - left
+        tb = top - bottom
+        fn = f - n
+
+        # Standard OpenGL off-axis frustum matrix (row-major).
+        P = np.array([
+            [2 * n / rl,          0,  (right + left) / rl,              0],
+            [         0, 2 * n / tb,  (top + bottom) / tb,              0],
+            [         0,          0,         -(f + n) / fn, -2 * f * n / fn],
+            [         0,          0,                    -1,              0],
+        ], dtype=np.float32)
+
+        # pyglet Mat4 / glUniformMatrix4fv expect column-major; store as flat array.
+        self._custom_projection = P.T.flatten()
+
+    def clear_intrinsics(self) -> None:
+        """Revert to symmetric FOV-based projection."""
+        self._custom_projection = None
+
     def get_front(self):
         """Get the camera front direction vector (read-only)."""
         from pyglet.math import Vec3 as PyVec3
+
+        if self._custom_front is not None:
+            return PyVec3(*self._custom_front).normalize()
 
         # Clamp pitch to avoid gimbal lock
         pitch = max(min(self.pitch, 89.0), -89.0)
@@ -103,6 +181,9 @@ class Camera:
         """Get the camera up direction vector (read-only)."""
         from pyglet.math import Vec3 as PyVec3
 
+        if self._custom_up is not None:
+            return PyVec3(*self._custom_up).normalize()
+
         # World up vector based on up axis
         if self.up_axis == 0:  # X up
             world_up = PyVec3(1.0, 0.0, 0.0)
@@ -139,9 +220,16 @@ class Camera:
         """
         Compute projection matrix.
 
+        Returns the matrix set by :meth:`set_intrinsics` when available,
+        otherwise falls back to the symmetric FOV-based perspective projection.
+
         Returns:
-            np.ndarray: 4x4 projection matrix
+            np.ndarray: 4x4 projection matrix as a flat 16-element array in
+            column-major order (compatible with ``glUniformMatrix4fv``).
         """
+        if self._custom_projection is not None:
+            return self._custom_projection
+
         from pyglet.math import Mat4 as PyMat4
 
         if self.height == 0:
