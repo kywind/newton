@@ -92,6 +92,32 @@ class Camera:
         self._custom_front = None
         self._custom_up = None
 
+    def adopt_custom_rotation(self) -> None:
+        """Back-convert the custom front vector into pitch/yaw and clear the override.
+
+        After this call, :meth:`get_front` reads from ``pitch``/``yaw`` again so
+        mouse-drag updates to those fields take effect.
+        """
+        if self._custom_front is None:
+            return
+
+        f = self._custom_front / np.linalg.norm(self._custom_front)
+
+        if self.up_axis == 2:  # Z up
+            # front_z = sin(pitch), front_x = cos(yaw)*cos(pitch), front_y = sin(yaw)*cos(pitch)
+            self.pitch = float(np.degrees(np.arcsin(np.clip(f[2], -1.0, 1.0))))
+            self.yaw   = float(np.degrees(np.arctan2(f[1], f[0])))
+        elif self.up_axis == 0:  # X up
+            # front_x = sin(pitch), front_y = cos(yaw)*cos(pitch), front_z = sin(yaw)*cos(pitch)
+            self.pitch = float(np.degrees(np.arcsin(np.clip(f[0], -1.0, 1.0))))
+            self.yaw   = float(np.degrees(np.arctan2(f[2], f[1])))
+        else:  # Y up (default)
+            # front_y = sin(pitch), front_x = cos(yaw)*cos(pitch), front_z = sin(yaw)*cos(pitch)
+            self.pitch = float(np.degrees(np.arcsin(np.clip(f[1], -1.0, 1.0))))
+            self.yaw   = float(np.degrees(np.arctan2(f[2], f[0])))
+
+        self.clear_rotation()
+
     def set_intrinsics(self, fx: float, fy: float, cx: float, cy: float) -> None:
         """Set camera intrinsics from an OpenCV pinhole camera matrix.
 

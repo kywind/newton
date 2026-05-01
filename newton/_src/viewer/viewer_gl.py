@@ -1190,6 +1190,9 @@ class ViewerGL(ViewerBase):
 
             # Map screen-space right drag to a right turn (clockwise),
             # independent of world up-axis convention.
+            # If a custom rotation override is active (e.g. set by set_rotation()),
+            # convert it to pitch/yaw first so the drag delta applies correctly.
+            self.camera.adopt_custom_rotation()
             self.camera.yaw -= dx
             self.camera.pitch += dy
 
