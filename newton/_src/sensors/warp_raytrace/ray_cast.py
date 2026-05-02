@@ -83,7 +83,7 @@ def closest_hit_shape(
                 hit_face_id = wp.int32(-1)
                 hit_mesh_id = wp.int32(-1)
 
-                if shape_types[si] == RenderShapeType.MESH:
+                if shape_types[si] == RenderShapeType.MESH or shape_types[si] == RenderShapeType.CONVEX_MESH:
                     hit, hit_dist, hit_normal, hit_u, hit_v, hit_face_id, hit_mesh_id = ray.ray_mesh_with_bvh(
                         mesh_ids,
                         shape_mesh_indices[si],
@@ -329,7 +329,7 @@ def first_hit_shape(
 
                 dist = wp.float32(MAXVAL)
 
-                if shape_types[si] == RenderShapeType.MESH:
+                if shape_types[si] == RenderShapeType.MESH or shape_types[si] == RenderShapeType.CONVEX_MESH:
                     _h, dist, _n, _u, _v, _f, _mesh_id = ray.ray_mesh_with_bvh(
                         mesh_ids,
                         shape_mesh_indices[si],

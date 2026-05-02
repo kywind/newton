@@ -65,6 +65,8 @@ def is_supported_shape_type(shape_type: wp.int32) -> wp.bool:
         return True
     if shape_type == RenderShapeType.MESH:
         return True
+    if shape_type == RenderShapeType.CONVEX_MESH:
+        return True
     wp.printf("Unsupported shape geom type: %d\n", shape_type)
     return False
 

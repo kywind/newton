@@ -188,7 +188,7 @@ def compute_shape_bvh_bounds(
         lower, upper = compute_cone_bounds(transform, size)
     elif geom_type == RenderShapeType.PLANE:
         lower, upper = compute_plane_bounds(transform, size)
-    elif geom_type == RenderShapeType.MESH:
+    elif geom_type == RenderShapeType.MESH or geom_type == RenderShapeType.CONVEX_MESH:
         min_bounds = mesh_bounds[shape_mesh_indices[shape_index], 0]
         max_bounds = mesh_bounds[shape_mesh_indices[shape_index], 1]
         lower, upper = compute_mesh_bounds(transform, size, min_bounds, max_bounds)

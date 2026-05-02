@@ -121,7 +121,7 @@ def sample_texture(
             texture_width,
         )
 
-    if shape_type == RenderShapeType.MESH:
+    if shape_type == RenderShapeType.MESH or shape_type == RenderShapeType.CONVEX_MESH:
         if f < 0 or mesh_id < 0 or not mesh_texcoord_offsets.shape[0]:
             return tex_color
 

@@ -28,6 +28,7 @@ except ImportError:
         BOX = 6
         MESH = 7
         CONE = 9
+        CONVEX_MESH = 10
         NONE = 11
 
 
@@ -42,6 +43,7 @@ class RenderShapeType(enum.IntEnum):
     BOX = GeoType.BOX
     MESH = GeoType.MESH
     CONE = GeoType.CONE
+    CONVEX_MESH = GeoType.CONVEX_MESH
     NONE = GeoType.NONE
 
 
