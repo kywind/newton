@@ -196,6 +196,7 @@ class ViewerGL(ViewerBase):
         self.renderer.set_title("Newton Viewer")
 
         self._paused = False
+        self.render_scene = True
         self._packed_vbo_xforms = None
 
         # State caching for selection panel
@@ -738,6 +739,9 @@ class ViewerGL(ViewerBase):
         """
         self._last_state = state
 
+        if not self.render_scene:
+            return
+
         if self.model is None:
             return
 
@@ -902,8 +906,11 @@ class ViewerGL(ViewerBase):
         if self.renderer.has_exit():
             return
 
-        # Render the scene and present it
-        self.renderer.render(self.camera, self.objects, self.lines)
+        # Render the scene and present it. render_scene=False keeps the GL
+        # window alive for input/camera/UI, but avoids drawing Newton geometry.
+        objects = self.objects if self.render_scene else {}
+        lines = self.lines if self.render_scene else {}
+        self.renderer.render(self.camera, objects, lines)
 
         # Always update FPS tracking, even if UI is hidden
         self._update_fps()
