@@ -110,7 +110,15 @@ def sample_texture(
     if material_index == -1 or texture_index == -1:
         return tex_color
 
-    if shape_type == RenderShapeType.PLANE:
+    if (
+        shape_type == RenderShapeType.PLANE
+        or shape_type == RenderShapeType.SPHERE
+        or shape_type == RenderShapeType.BOX
+        or shape_type == RenderShapeType.CAPSULE
+        or shape_type == RenderShapeType.ELLIPSOID
+        or shape_type == RenderShapeType.CYLINDER
+        or shape_type == RenderShapeType.CONE
+    ):
         tex_color = sample_texture_plane(
             hit_point,
             shape_transform,
