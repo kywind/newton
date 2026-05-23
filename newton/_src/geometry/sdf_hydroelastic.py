@@ -282,6 +282,7 @@ class HydroelasticSDF:
 
         with wp.ScopedDevice(device):
             self.num_shape_pairs_array = wp.full((1,), self.max_num_shape_pairs, dtype=wp.int32)
+            self.shape_sdf_data = wp.empty((self.n_shapes,), dtype=SDFData, device=device)
 
             # Allocate buffers for octree traversal (broadphase + 4 refinement levels)
             self.iso_buffer_counts = [wp.zeros((1,), dtype=wp.int32) for _ in range(5)]
@@ -511,26 +512,25 @@ class HydroelasticSDF:
             shape_pairs_sdf_sdf_count: Number of valid shape pairs.
             writer_data: Contact data writer for output.
         """
-        shape_sdf_data = wp.empty(shape=(shape_sdf_index.shape[0],), dtype=SDFData, device=self.device)
         wp.launch(
             kernel=map_shape_sdf_data_kernel,
             dim=shape_sdf_index.shape[0],
             inputs=[sdf_data, shape_sdf_index],
-            outputs=[shape_sdf_data],
+            outputs=[self.shape_sdf_data],
             device=self.device,
         )
 
         self._broadphase_sdfs(
-            shape_sdf_data,
+            self.shape_sdf_data,
             shape_transform,
             shape_pairs_sdf_sdf,
             shape_pairs_sdf_sdf_count,
         )
 
-        self._find_iso_voxels(shape_sdf_data, shape_transform, shape_contact_margin)
+        self._find_iso_voxels(self.shape_sdf_data, shape_transform, shape_contact_margin)
 
         if self.config.reduce_contacts:
-            self._generate_contacts(shape_sdf_data, shape_transform, shape_contact_margin)
+            self._generate_contacts(self.shape_sdf_data, shape_transform, shape_contact_margin)
             self._reduce_decode_contacts(
                 shape_transform,
                 shape_collision_aabb_lower,
@@ -540,7 +540,7 @@ class HydroelasticSDF:
                 writer_data,
             )
         else:
-            self._generate_contacts(shape_sdf_data, shape_transform, shape_contact_margin)
+            self._generate_contacts(self.shape_sdf_data, shape_transform, shape_contact_margin)
             self._decode_contacts(
                 shape_transform,
                 shape_contact_margin,
@@ -574,15 +574,17 @@ class HydroelasticSDF:
         # dropped-contact conditions outside stdout-captured environments.
         self._launch_counter += 1
         if self._launch_counter % self._host_warning_poll_interval == 0:
-            hashtable_failures = int(self.contact_reduction.reducer.ht_insert_failures.numpy()[0])
-            if hashtable_failures > 0:
-                warnings.warn(
-                    "Hydroelastic reduction dropped contacts due to hashtable insert "
-                    f"failures ({hashtable_failures}). Increase rigid_contact_max "
-                    "and/or HydroelasticSDF.Config.buffer_fraction.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
+            device = wp.get_device(self.device)
+            if not (device.is_cuda and device.is_capturing):
+                hashtable_failures = int(self.contact_reduction.reducer.ht_insert_failures.numpy()[0])
+                if hashtable_failures > 0:
+                    warnings.warn(
+                        "Hydroelastic reduction dropped contacts due to hashtable insert "
+                        f"failures ({hashtable_failures}). Increase rigid_contact_max "
+                        "and/or HydroelasticSDF.Config.buffer_fraction.",
+                        RuntimeWarning,
+                        stacklevel=2,
+                    )
 
     def _broadphase_sdfs(
         self,
